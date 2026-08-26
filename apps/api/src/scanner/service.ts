@@ -16,28 +16,32 @@ export type ListLinksOptions = { status?: LinkStatus; search?: string; groupJids
 
 export class ScannerService {
   private autoJoin: ((inviteCode: string) => Promise<void>) | null = null;
-  public constructor(private readonly logger: FastifyBaseLogger) {}
+  public constructor(private readonly logger: FastifyBaseLogger, private readonly accountId = 'main') {}
+
+  private settingKey(key: string): string { return `${this.accountId}.${key}`; }
 
   public setAutoJoinHandler(handler: (inviteCode: string) => Promise<void>): void { this.autoJoin = handler; }
 
   public async isEnabled(): Promise<boolean> {
-    const setting = await db.query.appSettings.findFirst({ where: eq(appSettings.key, SCANNER_ENABLED_SETTING) });
+    const setting = await db.query.appSettings.findFirst({ where: eq(appSettings.key, this.settingKey(SCANNER_ENABLED_SETTING)) });
     return setting ? setting.value === 'true' : true;
   }
 
   public async setEnabled(enabled: boolean): Promise<boolean> {
-    await db.insert(appSettings).values({ key: SCANNER_ENABLED_SETTING, value: String(enabled), updatedAt: timestamp() })
+    const key = this.settingKey(SCANNER_ENABLED_SETTING);
+    await db.insert(appSettings).values({ key, value: String(enabled), updatedAt: timestamp() })
       .onConflictDoUpdate({ target: appSettings.key, set: { value: String(enabled), updatedAt: timestamp() } });
     return enabled;
   }
 
   public async isAutoJoinEnabled(): Promise<boolean> {
-    const setting = await db.query.appSettings.findFirst({ where: eq(appSettings.key, AUTO_JOIN_ENABLED_SETTING) });
+    const setting = await db.query.appSettings.findFirst({ where: eq(appSettings.key, this.settingKey(AUTO_JOIN_ENABLED_SETTING)) });
     return setting?.value === 'true';
   }
 
   public async setAutoJoinEnabled(enabled: boolean): Promise<boolean> {
-    await db.insert(appSettings).values({ key: AUTO_JOIN_ENABLED_SETTING, value: String(enabled), updatedAt: timestamp() })
+    const key = this.settingKey(AUTO_JOIN_ENABLED_SETTING);
+    await db.insert(appSettings).values({ key, value: String(enabled), updatedAt: timestamp() })
       .onConflictDoUpdate({ target: appSettings.key, set: { value: String(enabled), updatedAt: timestamp() } });
     return enabled;
   }
@@ -46,7 +50,7 @@ export class ScannerService {
     const groupJid = message.key.remoteJid;
     if (!groupJid?.endsWith('@g.us') || message.key.fromMe || !(await this.isEnabled())) return 0;
 
-    const group = await db.query.groups.findFirst({ where: eq(groups.whatsappGroupJid, groupJid) });
+    const group = await db.query.groups.findFirst({ where: and(eq(groups.accountId, this.accountId), eq(groups.whatsappGroupJid, groupJid)) });
     if (!group || !group.isScannerEnabled || group.isExcluded) return 0;
 
     const links = deduplicateInviteLinks(extractMessageText(message).flatMap(extractInviteLinks));
@@ -72,14 +76,14 @@ export class ScannerService {
   /** Persist a single invite sighting. The link row is unique; sightings remain lightweight. */
   public async recordSighting(link: InviteLink, sighting: { groupJid: string; groupName: string; messageId: string | null; occurredAt?: string }): Promise<{ id: string; isNew: boolean }> {
     const occurredAt = sighting.occurredAt ?? timestamp();
-    const existing = await db.query.discoveredLinks.findFirst({ where: eq(discoveredLinks.inviteUrl, link.inviteUrl) });
+    const existing = await db.query.discoveredLinks.findFirst({ where: and(eq(discoveredLinks.accountId, this.accountId), eq(discoveredLinks.inviteUrl, link.inviteUrl)) });
     const result = await db.insert(discoveredLinks).values({
-      id: randomUUID(), inviteUrl: link.inviteUrl, inviteCode: link.inviteCode,
+      id: randomUUID(), accountId: this.accountId, inviteUrl: link.inviteUrl, inviteCode: link.inviteCode,
       sourceGroupJid: sighting.groupJid, sourceGroupName: sighting.groupName,
       firstSeenAt: occurredAt, lastSeenAt: occurredAt, timesSeen: 1, sourceMessageId: sighting.messageId,
       status: 'NEW', notes: null,
     }).onConflictDoUpdate({
-      target: discoveredLinks.inviteUrl,
+      target: [discoveredLinks.accountId, discoveredLinks.inviteUrl],
       set: { lastSeenAt: occurredAt, timesSeen: sql`${discoveredLinks.timesSeen} + 1` },
     }).returning({ id: discoveredLinks.id });
     const linkId = result[0]?.id;
@@ -91,7 +95,7 @@ export class ScannerService {
   public async listLinks(options: ListLinksOptions = {}) {
     const limit = Math.min(Math.max(options.limit ?? 100, 1), 500);
     const offset = Math.max(options.offset ?? 0, 0);
-    const filters = [];
+    const filters = [eq(discoveredLinks.accountId, this.accountId)];
     if (options.status) filters.push(eq(discoveredLinks.status, options.status));
     if (options.search?.trim()) {
       const term = `%${options.search.trim().replace(/[%_]/g, '\\$&')}%`;
@@ -112,17 +116,17 @@ export class ScannerService {
     if (changes.status) update.status = changes.status;
     if (changes.notes !== undefined) update.notes = changes.notes;
     if (!Object.keys(update).length) return null;
-    const updated = await db.update(discoveredLinks).set(update).where(eq(discoveredLinks.id, id)).returning();
+    const updated = await db.update(discoveredLinks).set(update).where(and(eq(discoveredLinks.id, id), eq(discoveredLinks.accountId, this.accountId))).returning();
     return updated[0] ?? null;
   }
 
   public async getLink(id: string) {
     const [link] = await db.select({ id: discoveredLinks.id, inviteCode: discoveredLinks.inviteCode, inviteUrl: discoveredLinks.inviteUrl })
-      .from(discoveredLinks).where(eq(discoveredLinks.id, id)).limit(1);
+      .from(discoveredLinks).where(and(eq(discoveredLinks.id, id), eq(discoveredLinks.accountId, this.accountId))).limit(1);
     return link ?? null;
   }
 
-  public async deleteLink(id: string): Promise<void> { await db.delete(discoveredLinks).where(eq(discoveredLinks.id, id)); }
+  public async deleteLink(id: string): Promise<void> { await db.delete(discoveredLinks).where(and(eq(discoveredLinks.id, id), eq(discoveredLinks.accountId, this.accountId))); }
 
   public async exportLinks() {
     return db.select({
@@ -132,6 +136,6 @@ export class ScannerService {
       lastSeen: discoveredLinks.lastSeenAt,
       timesSeen: discoveredLinks.timesSeen,
       status: discoveredLinks.status,
-    }).from(discoveredLinks).orderBy(asc(discoveredLinks.firstSeenAt));
+    }).from(discoveredLinks).where(eq(discoveredLinks.accountId, this.accountId)).orderBy(asc(discoveredLinks.firstSeenAt));
   }
 }

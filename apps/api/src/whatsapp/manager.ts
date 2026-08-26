@@ -6,8 +6,9 @@ import { existsSync, readFileSync } from 'node:fs';
 import { cp, mkdir, rm } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { and, eq } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { groups } from '../db/schema.js';
+import { groups, whatsappAccounts } from '../db/schema.js';
 import { config } from '../config.js';
 import { ScannerService } from '../scanner/service.js';
 
@@ -31,20 +32,27 @@ export class WhatsAppManager {
   private requestedDisconnect = false;
   private status: WhatsAppStatus = { state: 'DISCONNECTED', phone: null, lastConnectedAt: null, qrDataUrl: null, error: null };
   private listeners = new Set<(status: WhatsAppStatus) => void>();
-  private readonly authDir = config.WHATSAPP_AUTH_DIR;
+  private groupJoinListeners = new Set<(group: { jid: string; name: string }) => void | Promise<void>>();
+  private readonly authDir: string;
   // Keep a local recovery copy outside the live Baileys folder. A normal
   // restart can restore this copy if an interrupted process leaves the live
   // folder incomplete.
-  private readonly authBackupDir = resolve(dirname(config.DATABASE_PATH), 'whatsapp-auth-backup');
+  private readonly authBackupDir: string;
   private authSnapshotPromise: Promise<void> = Promise.resolve();
 
-  public constructor(private readonly logger: FastifyBaseLogger, private readonly scanner: ScannerService) {
+  public constructor(private readonly logger: FastifyBaseLogger, private readonly scanner: ScannerService, authDir = config.WHATSAPP_AUTH_DIR, private readonly accountId = 'main') {
+    this.authDir = authDir;
+    this.authBackupDir = resolve(dirname(config.DATABASE_PATH), 'whatsapp-auth-backups', accountId);
     scanner.setAutoJoinHandler(async (inviteCode) => { await this.joinGroup(inviteCode); });
   }
 
   public getStatus(): WhatsAppStatus { return { ...this.status }; }
   public getSocket(): WASocket | null { return this.socket; }
   public subscribe(listener: (status: WhatsAppStatus) => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
+  public subscribeGroupJoined(listener: (group: { jid: string; name: string }) => void | Promise<void>): () => void {
+    this.groupJoinListeners.add(listener);
+    return () => this.groupJoinListeners.delete(listener);
+  }
   public hasSavedSession(): boolean {
     return this.hasSavedSessionAt(this.authDir);
   }
@@ -143,6 +151,7 @@ export class WhatsAppManager {
       if (update.connection === 'open') {
         const phone = socket.user?.id?.split(':')[0] ?? null;
         this.setStatus({ state: 'CONNECTED', phone, lastConnectedAt: now(), qrDataUrl: null, error: null });
+        if (phone) await db.update(whatsappAccounts).set({ phone, updatedAt: now() }).where(eq(whatsappAccounts.id, this.accountId));
         this.logger.info({ phone }, 'WhatsApp connected');
         void this.queueAuthSnapshot();
         await this.syncGroups();
@@ -176,9 +185,9 @@ export class WhatsAppManager {
     const syncedAt = now();
     for (const [jid, metadata] of Object.entries(available)) {
       await db.insert(groups).values({
-        id: randomUUID(), whatsappGroupJid: jid, name: metadata.subject || jid, description: metadata.desc ?? null,
+        id: randomUUID(), accountId: this.accountId, whatsappGroupJid: jid, name: metadata.subject || jid, description: metadata.desc ?? null,
         isTarget: false, isScannerEnabled: true, isExcluded: false, lastSyncedAt: syncedAt, createdAt: syncedAt, updatedAt: syncedAt,
-      }).onConflictDoUpdate({ target: groups.whatsappGroupJid, set: { name: metadata.subject || jid, description: metadata.desc ?? null, lastSyncedAt: syncedAt, updatedAt: syncedAt } });
+      }).onConflictDoUpdate({ target: [groups.accountId, groups.whatsappGroupJid], set: { name: metadata.subject || jid, description: metadata.desc ?? null, lastSyncedAt: syncedAt, updatedAt: syncedAt } });
     }
     this.logger.info({ groups: Object.keys(available).length }, 'WhatsApp group sync completed');
     return Object.keys(available).length;
@@ -189,6 +198,10 @@ export class WhatsAppManager {
     const groupJid = await this.socket.groupAcceptInvite(inviteCode);
     if (!groupJid) throw new Error('WhatsApp did not confirm that the group was joined.');
     await this.syncGroups();
+    const [group] = await db.select({ name: groups.name }).from(groups).where(and(eq(groups.accountId, this.accountId), eq(groups.whatsappGroupJid, groupJid))).limit(1);
+    if (group) {
+      for (const listener of this.groupJoinListeners) void listener({ jid: groupJid, name: group.name });
+    }
     this.logger.info({ groupJid }, 'Joined WhatsApp group from an explicitly selected invite link');
     return groupJid;
   }

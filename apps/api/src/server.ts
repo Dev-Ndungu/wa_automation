@@ -6,16 +6,15 @@ import { readFile } from 'node:fs/promises';
 import { extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureInitialAdministrator, removeExpiredSessions, removeLegacyDefaultAdministrator } from './auth/service.js';
-import { CampaignService } from './campaigns/service.js';
+import { AccountService } from './accounts/service.js';
 import { config } from './config.js';
 import { bootstrapDatabase } from './db/bootstrap.js';
 import { campaignRoutes } from './routes/campaigns.js';
+import { accountRoutes } from './routes/accounts.js';
 import { groupRoutes } from './routes/groups.js';
 import { systemRoutes } from './routes/system.js';
 import { linkRoutes } from './routes/links.js';
 import { whatsappRoutes } from './routes/whatsapp.js';
-import { ScannerService } from './scanner/service.js';
-import { WhatsAppManager } from './whatsapp/manager.js';
 
 const app = Fastify({
   // A campaign image is submitted as a base64 data URL. Allow the documented
@@ -47,13 +46,12 @@ await app.register(cookie);
 await app.register(cors, { origin: config.WEB_ORIGIN, credentials: true });
 await app.register(rateLimit, { global: false });
 await app.register(systemRoutes);
-const scanner = new ScannerService(app.log);
-const whatsapp = new WhatsAppManager(app.log, scanner);
-await app.register(groupRoutes(whatsapp));
-await app.register(whatsappRoutes(whatsapp));
-await app.register(linkRoutes(scanner, whatsapp));
-const campaignService = new CampaignService(whatsapp, app.log);
-await app.register(campaignRoutes(campaignService));
+const accounts = new AccountService(app.log);
+await app.register(accountRoutes(accounts));
+await app.register(groupRoutes(accounts));
+await app.register(whatsappRoutes(accounts));
+await app.register(linkRoutes(accounts));
+await app.register(campaignRoutes(accounts));
 
 app.get('/', async (_request, reply) => {
   const { contents } = await sendDashboardFile('index.html');
@@ -74,8 +72,7 @@ await ensureInitialAdministrator();
 app.log.info('Initial administrator check completed');
 await removeExpiredSessions();
 app.log.info('Expired-session cleanup completed');
-await campaignService.recover();
-if (whatsapp.hasSavedSession()) void whatsapp.start();
+await accounts.initialize();
 
 const close = async () => {
   await app.close();

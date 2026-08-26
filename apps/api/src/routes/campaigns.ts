@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
-import type { CampaignService } from '../campaigns/service.js';
+import type { AccountService } from '../accounts/service.js';
+import { accountIdFrom } from './accounts.js';
 
 function idFrom(request: { params: unknown }): string {
   const id = (request.params as { id?: unknown }).id;
@@ -7,25 +8,25 @@ function idFrom(request: { params: unknown }): string {
   return id;
 }
 
-export function campaignRoutes(service: CampaignService) {
+export function campaignRoutes(accounts: AccountService) {
   return async function routes(app: FastifyInstance): Promise<void> {
-    app.get('/api/campaigns', async () => service.list());
-    app.get('/api/campaigns/:id', async (request) => service.get(idFrom(request)));
-    app.post('/api/campaigns/source-messages/manual', async (request) => service.captureManualSource(request.body as never));
-    app.post('/api/campaigns', async (request) => service.create(request.body as never));
+    app.get('/api/campaigns', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.list());
+    app.get('/api/campaigns/:id', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.get(idFrom(request)));
+    app.post('/api/campaigns/source-messages/manual', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.captureManualSource(request.body as never));
+    app.post('/api/campaigns', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.create(request.body as never));
     app.put('/api/campaigns/:id', async (request, reply) => {
       try {
-        return await service.update(idFrom(request), request.body as never);
+        return await (await accounts.get(accountIdFrom(request))).campaigns.update(idFrom(request), request.body as never);
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Could not save campaign changes.';
         return reply.code(400).send({ message });
       }
     });
-    app.post('/api/campaigns/:id/start', async (request) => service.start(idFrom(request)));
-    app.post('/api/campaigns/:id/run-now', async (request) => service.runNow(idFrom(request)));
-    app.post('/api/campaigns/:id/pause', async (request) => service.pause(idFrom(request)));
-    app.post('/api/campaigns/:id/resume', async (request) => service.resume(idFrom(request)));
-    app.post('/api/campaigns/:id/stop', async (request) => service.stop(idFrom(request)));
-    app.post('/api/campaigns/stop-all', async () => service.stopAll());
+    app.post('/api/campaigns/:id/start', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.start(idFrom(request)));
+    app.post('/api/campaigns/:id/run-now', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.runNow(idFrom(request)));
+    app.post('/api/campaigns/:id/pause', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.pause(idFrom(request)));
+    app.post('/api/campaigns/:id/resume', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.resume(idFrom(request)));
+    app.post('/api/campaigns/:id/stop', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.stop(idFrom(request)));
+    app.post('/api/campaigns/stop-all', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.stopAll());
   };
 }
