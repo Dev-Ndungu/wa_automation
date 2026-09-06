@@ -17,9 +17,13 @@ import { linkRoutes } from './routes/links.js';
 import { whatsappRoutes } from './routes/whatsapp.js';
 
 const app = Fastify({
-  // A campaign image is submitted as a base64 data URL. Allow the documented
-  // roughly-4 MB image maximum plus base64 overhead and JSON framing.
-  bodyLimit: 12_000_000,
+  // Campaign media is submitted as base64 data URLs. A campaign save request
+  // carries up to 10 files: the documented roughly-4 MB image maximum plus
+  // base64 overhead and JSON framing, and the roughly-16 MB MP4 video maximum
+  // (a 16 MB raw video is a ~21.3 MB base64 data URL; with JSON framing
+  // ~22.4M chars). Ten such videos come to ~214 MB of base64, comfortably
+  // under the limit below.
+  bodyLimit: 256_000_000,
   logger: {
     level: config.LOG_LEVEL,
     redact: ['req.headers.cookie', 'req.headers.authorization', 'res.headers.set-cookie', 'password', 'passwordHash', 'csrfToken'],

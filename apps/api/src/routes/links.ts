@@ -59,7 +59,12 @@ export function linkRoutes(accounts: AccountService) {
       if (!id.success) return reply.code(400).send({ message: 'Invalid link ID.' });
       const link = await account.scanner.getLink(id.data);
       if (!link) return reply.code(404).send({ message: 'Link not found.' });
-      const groupJid = await account.whatsapp.joinGroup(link.inviteCode);
+      let groupJid: string;
+      try {
+        groupJid = await account.whatsapp.joinGroup(link.inviteCode);
+      } catch (error) {
+        return reply.code(400).send({ message: error instanceof Error ? error.message : 'Could not join this group.' });
+      }
       await account.scanner.deleteLink(link.id);
       return { groupJid, inviteUrl: link.inviteUrl };
     });

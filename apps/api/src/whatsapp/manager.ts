@@ -11,6 +11,7 @@ import { db } from '../db/client.js';
 import { groups, whatsappAccounts } from '../db/schema.js';
 import { config } from '../config.js';
 import { ScannerService } from '../scanner/service.js';
+import { burstJoinDenied, dailyJoinDenied, JOIN_BURST, JOIN_DAILY_LIMIT, joinsInWindow, joinsToday, lastJoinAt, recordJoin, requiredJoinDelaySeconds } from '../safety/limits.js';
 
 export type WhatsAppStatus = {
   state: 'DISCONNECTED' | 'CONNECTING' | 'QR_READY' | 'CONNECTED' | 'LOGGED_OUT';
@@ -21,6 +22,7 @@ export type WhatsAppStatus = {
 };
 
 const now = () => new Date().toISOString();
+const wait = (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
 // A fallback is kept for an offline machine. The normal path obtains the
 // current public WhatsApp Web revision with a strict timeout before linking.
 const whatsappWebVersion: [number, number, number] = [2, 3000, 1043857760];
@@ -39,6 +41,8 @@ export class WhatsAppManager {
   // folder incomplete.
   private readonly authBackupDir: string;
   private authSnapshotPromise: Promise<void> = Promise.resolve();
+  // Serializes join attempts (auto-join and manual joins share this queue).
+  private joinQueue: Promise<void> = Promise.resolve();
 
   public constructor(private readonly logger: FastifyBaseLogger, private readonly scanner: ScannerService, authDir = config.WHATSAPP_AUTH_DIR, private readonly accountId = 'main') {
     this.authDir = authDir;
@@ -194,16 +198,28 @@ export class WhatsAppManager {
   }
 
   public async joinGroup(inviteCode: string): Promise<string> {
-    if (!this.socket || this.status.state !== 'CONNECTED') throw new Error('WhatsApp is not connected.');
-    const groupJid = await this.socket.groupAcceptInvite(inviteCode);
-    if (!groupJid) throw new Error('WhatsApp did not confirm that the group was joined.');
-    await this.syncGroups();
-    const [group] = await db.select({ name: groups.name }).from(groups).where(and(eq(groups.accountId, this.accountId), eq(groups.whatsappGroupJid, groupJid))).limit(1);
-    if (group) {
-      for (const listener of this.groupJoinListeners) void listener({ jid: groupJid, name: group.name });
-    }
-    this.logger.info({ groupJid }, 'Joined WhatsApp group from an explicitly selected invite link');
-    return groupJid;
+    const run = this.joinQueue.then(async () => {
+      if (!this.socket || this.status.state !== 'CONNECTED') throw new Error('WhatsApp is not connected.');
+      if (burstJoinDenied(await joinsInWindow(this.accountId, JOIN_BURST.windowMinutes * 60_000))) throw new Error(`Join limit reached: at most ${JOIN_BURST.limit} joins per ${JOIN_BURST.windowMinutes} minutes. Try again later.`);
+      if (dailyJoinDenied(await joinsToday(this.accountId))) throw new Error(`Daily join limit reached: at most ${JOIN_DAILY_LIMIT} joins per day. Try again tomorrow.`);
+      // Random wait between joins is built in (see safety/limits.ts); the queue
+      // wait below is the only place joins are throttled.
+      const required = requiredJoinDelaySeconds(await lastJoinAt(this.accountId));
+      if (required > 0) await wait(required * 1_000);
+      const groupJid = await this.socket.groupAcceptInvite(inviteCode);
+      if (!groupJid) throw new Error('WhatsApp did not confirm that the group was joined.');
+      await this.syncGroups();
+      await db.update(groups).set({ joinedAt: new Date().toISOString() }).where(and(eq(groups.accountId, this.accountId), eq(groups.whatsappGroupJid, groupJid)));
+      const [group] = await db.select({ name: groups.name }).from(groups).where(and(eq(groups.accountId, this.accountId), eq(groups.whatsappGroupJid, groupJid))).limit(1);
+      if (group) {
+        for (const listener of this.groupJoinListeners) void listener({ jid: groupJid, name: group.name });
+      }
+      await recordJoin(this.accountId, groupJid);
+      this.logger.info({ groupJid }, 'Joined WhatsApp group from an explicitly selected invite link');
+      return groupJid;
+    });
+    this.joinQueue = run.then(() => undefined, () => undefined);
+    return run;
   }
 
   public async getGroupInviteLink(groupJid: string): Promise<string> {
