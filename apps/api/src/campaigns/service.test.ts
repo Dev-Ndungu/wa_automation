@@ -8,7 +8,7 @@
 // Pacing is injected through the constructor's CampaignPacing seam: the shared
 // service runs with instant gaps so the suite is deterministic and fast, and
 // the concurrent-campaigns test uses its own service with a 2s floor. The
-// production default (random 45-180s draws, see safety/limits.ts) never runs
+// production default (random 60-240s draws, see safety/limits.ts) never runs
 // here.
 
 process.env.NODE_ENV = 'test';
@@ -25,8 +25,8 @@ import { rmSync } from 'node:fs';
 import test, { after, before } from 'node:test';
 import { eq, inArray } from 'drizzle-orm';
 import type { FastifyBaseLogger } from 'fastify';
-import { actionLog, campaignSources, campaignTargets, campaigns, groups, sourceMessages } from '../db/schema.js';
-import type { WhatsAppManager } from '../whatsapp/manager.js';
+import { actionLog, campaignSources, campaignTargets, campaigns, groups, operationalLogs, sourceMessages } from '../db/schema.js';
+import type { WhatsAppManager, WhatsAppStatus } from '../whatsapp/manager.js';
 
 const TINY_PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
 const TINY_VIDEO = 'data:video/mp4;base64,AAAA';
@@ -55,12 +55,13 @@ const loggerStub = {
 } as unknown as FastifyBaseLogger;
 
 // One service instance shared by all tests, bound to the 'main' account. The
-// pacing seam replaces the production random draws (45-180s gaps, 30-120s
+// pacing seam replaces the production random draws (60-240s gaps, 30-120s
 // warm-up) with instant values so the send loop is deterministic.
 const service = new CampaignService(whatsappStub, loggerStub, 'main', {
   minSendGapSeconds: 0,
   sendGapSeconds: () => 0,
   warmupSeconds: () => 0,
+  reconnectSettleMs: () => 0,
 });
 
 before(async () => {
@@ -297,7 +298,7 @@ test('cooldown parks a recently sent group as WAITING until the cooldown passes'
 
   sentCalls.length = 0;
   await service.runNow(campaign.id);
-  // The cooldown is drawn from the frozen 12-36h range in safety/limits.ts —
+  // The cooldown is drawn from the frozen 18-48h range in safety/limits.ts —
   // deliberately not injectable, so any send since now parks the group.
   await waitForParkedTarget(campaign.id);
 
@@ -327,7 +328,7 @@ test('grace period parks a newly joined group as WAITING until the grace passes'
 
   sentCalls.length = 0;
   await service.runNow(campaign.id);
-  // The grace is drawn from the frozen 90-240 minute range in safety/limits.ts —
+  // The grace is drawn from the frozen 120-360 minute range in safety/limits.ts —
   // a group joined just now always parks, whatever the draw.
   await waitForParkedTarget(campaign.id);
 
@@ -368,6 +369,11 @@ test('daily send budget pauses the campaign before any message goes out', async 
   await waitForPause(campaign.id);
 
   assert.equal(sentCalls.length, 0, 'the budget must stop sends before the first message');
+
+  // The budget pause must not leave the target stranded in SENDING: the row is
+  // still QUEUED so it can be picked up after the next UTC day.
+  const [target] = await db.select({ status: campaignTargets.status }).from(campaignTargets).where(eq(campaignTargets.campaignId, campaign.id));
+  assert.equal(target.status, 'QUEUED', 'a budget-paused target must return to QUEUED, never stay SENDING');
 
   // Remove the budget rows so later tests see an empty action log
   // (test-order independence).
@@ -419,6 +425,7 @@ test('concurrent campaigns keep every account send at least the minimum gap apar
     minSendGapSeconds: 2,
     sendGapSeconds: () => 0,
     warmupSeconds: () => 0,
+    reconnectSettleMs: () => 0,
   });
   sentCalls.length = 0;
   sendTimes.length = 0;
@@ -460,4 +467,161 @@ test('concurrent campaigns keep every account send at least the minimum gap apar
     assert.ok(gap >= 1900, `account sends ${i - 1} and ${i} were only ${gap}ms apart; the 2s account-wide floor must hold across campaigns`);
   }
   assert.ok(sendTimes[3] - sendTimes[0] >= 3 * 1900, 'the four sends must span at least three full floor intervals');
+});
+
+/** Fake WhatsApp whose status listener is captured, so a test can push
+ *  connection transitions the way the real manager's connection.update handler
+ *  does. getStatus always reports CONNECTED, so the worker send loop never
+ *  bails out; only the settle-transition logic sees the pushed events. */
+function controllableWhatsapp(onSend: () => Promise<void>): { fake: WhatsAppManager; push: (state: WhatsAppStatus['state']) => void } {
+  const listeners = new Set<(status: WhatsAppStatus) => void>();
+  const connectedStatus: WhatsAppStatus = { state: 'CONNECTED', phone: null, lastConnectedAt: null, qrDataUrl: null, error: null };
+  const fake = {
+    getSocket: () => ({ sendMessage: async () => { await onSend(); } }),
+    getStatus: () => connectedStatus,
+    subscribe: (listener: (status: WhatsAppStatus) => void) => { listeners.add(listener); return () => listeners.delete(listener); },
+    subscribeGroupJoined: () => noop,
+  } as unknown as WhatsAppManager;
+  return {
+    fake,
+    push: (state: WhatsAppStatus['state']) => {
+      for (const listener of [...listeners]) listener({ ...connectedStatus, state });
+    },
+  };
+}
+
+/** Poll until the campaign is PAUSED by the circuit breaker. */
+async function waitForBreakerPause(campaignId: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const [campaign] = await db.select({ status: campaigns.status, pauseReason: campaigns.pauseReason })
+      .from(campaigns).where(eq(campaigns.id, campaignId)).limit(1);
+    if (campaign?.status === 'PAUSED' && campaign.pauseReason?.includes('consecutive send failures')) return;
+    if (Date.now() >= deadline) {
+      assert.fail(`campaign ${campaignId} did not auto-pause on the circuit breaker: ${JSON.stringify(campaign)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+test('settle window gates the first send after a reconnect and is re-drawn per reconnect', async () => {
+  // The settle draw is injected as a deterministic 2s window; the suite's
+  // other instant pacing never exercises this path.
+  const { fake, push } = controllableWhatsapp(async () => { sentCalls.push({ jid: 'fake', content: {} }); sendTimes.push(Date.now()); });
+  const settleService = new CampaignService(fake, loggerStub, 'main', {
+    minSendGapSeconds: 0,
+    sendGapSeconds: () => 0,
+    warmupSeconds: () => 0,
+    reconnectSettleMs: () => 2000,
+  });
+  sentCalls.length = 0;
+  sendTimes.length = 0;
+
+  async function sendCampaign(name: string): Promise<void> {
+    const jids = [`settle-${name}-a-${randomUUID()}@g.us`, `settle-${name}-b-${randomUUID()}@g.us`];
+    for (const jid of jids) await insertGroup(jid, `Settle ${name} ${jid}`);
+    const captured = await settleService.captureManualSource({ text: `Settle probe ${name}`, label: `Settle ${name}` });
+    const campaign = await settleService.create({
+      name: `Settle campaign ${name}`,
+      // sourceMessageId: undefined — see the multi-file test for the rationale.
+      sourceMessageId: undefined,
+      sourceMessageIds: [captured.sources[0].id],
+      groupJids: jids,
+      schedule: { type: 'ONCE' },
+      shuffleOrder: false,
+    });
+    await settleService.runNow(campaign.id);
+    await waitForTargetsSent(campaign.id);
+    await waitForCampaignStatus(campaign.id, 'COMPLETED');
+  }
+
+  // A drop and a return: the return is a reconnect, so the first send must wait
+  // out the whole settle window even though every pacing gap is instant.
+  push('DISCONNECTED');
+  const firstReturnAtMs = Date.now();
+  push('CONNECTED');
+  await sendCampaign('one');
+  assert.ok(sendTimes[0] - firstReturnAtMs >= 1900, `first send after reconnect fired ${sendTimes[0] - firstReturnAtMs}ms in; the settle window must gate it`);
+
+  // A second drop and return draws the window again: sends may only resume
+  // after the fresh settle, never on the strength of the previous one.
+  push('DISCONNECTED');
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const secondReturnAtMs = Date.now();
+  push('CONNECTED');
+  await sendCampaign('two');
+  assert.ok(sendTimes[2] - secondReturnAtMs >= 1900, `first send after the second reconnect fired ${sendTimes[2] - secondReturnAtMs}ms in; the settle window must be re-drawn per reconnect`);
+  assert.equal(sendTimes.length, 4);
+});
+
+test('circuit breaker pauses every running campaign after consecutive send failures and clears on run now', async () => {
+  let failSends = true;
+  const { fake } = controllableWhatsapp(async () => {
+    if (failSends) throw new Error('Connection reset by peer');
+    sentCalls.push({ jid: 'fake', content: {} });
+  });
+  const breakerService = new CampaignService(fake, loggerStub, 'main', {
+    minSendGapSeconds: 0,
+    sendGapSeconds: () => 0,
+    warmupSeconds: () => 0,
+    reconnectSettleMs: () => 0,
+  });
+  sentCalls.length = 0;
+
+  // Campaign A fails against a dead socket; campaign B is RUNNING too but has
+  // nothing to send (its group is parked in cooldown), so B proves the trip
+  // pauses the whole account, not just the failing campaign.
+  const failingJids = Array.from({ length: 5 }, (_, index) => `breaker-a${index}-${randomUUID()}@g.us`);
+  for (const jid of failingJids) await insertGroup(jid, `Breaker A ${jid}`);
+  const jidB = `breaker-b-${randomUUID()}@g.us`;
+  await insertGroup(jidB, 'Breaker B', { lastCampaignSentAt: new Date().toISOString() });
+
+  const capturedA = await breakerService.captureManualSource({ text: 'Breaker probe A', label: 'Breaker A' });
+  const campaignA = await breakerService.create({
+    name: 'Breaker campaign A',
+    // sourceMessageId: undefined — see the multi-file test for the rationale.
+    sourceMessageId: undefined,
+    sourceMessageIds: [capturedA.sources[0].id],
+    groupJids: failingJids,
+    schedule: { type: 'ONCE' },
+    shuffleOrder: false,
+  });
+  const capturedB = await breakerService.captureManualSource({ text: 'Breaker probe B', label: 'Breaker B' });
+  const campaignB = await breakerService.create({
+    name: 'Breaker campaign B',
+    // sourceMessageId: undefined — see the multi-file test for the rationale.
+    sourceMessageId: undefined,
+    sourceMessageIds: [capturedB.sources[0].id],
+    groupJids: [jidB],
+    schedule: { type: 'ONCE' },
+    shuffleOrder: false,
+  });
+
+  await breakerService.runNow(campaignB.id);
+  // B parks its only group in the frozen 18-48h cooldown and stays RUNNING.
+  await waitForParkedTarget(campaignB.id);
+  await breakerService.runNow(campaignA.id);
+  await waitForBreakerPause(campaignA.id);
+  await waitForBreakerPause(campaignB.id);
+
+  assert.equal(sentCalls.length, 0, 'a dead connection must not deliver anything');
+  assert.ok(breakerService.getCircuitWarning()?.includes('paused'), 'the account warning must be visible while the breaker is open');
+  const [pausedB] = await db.select({ status: campaigns.status, pauseReason: campaigns.pauseReason }).from(campaigns).where(eq(campaigns.id, campaignB.id));
+  assert.equal(pausedB.status, 'PAUSED', 'a parked campaign of the same account must be paused by the breaker too');
+  assert.ok(pausedB.pauseReason?.includes('consecutive send failures'), 'the paused campaign must carry the frozen breaker reason');
+  const failedRows = await db.select({ status: campaignTargets.status }).from(campaignTargets).where(eq(campaignTargets.campaignId, campaignA.id));
+  assert.ok(failedRows.every((row) => row.status === 'FAILED') && failedRows.length === 5, `all five failing targets must be FAILED, got ${JSON.stringify(failedRows)}`);
+
+  const tripLogs = await db.select({ level: operationalLogs.level }).from(operationalLogs)
+    .where(eq(operationalLogs.event, 'campaign.auto_paused'));
+  const breakerLogs = tripLogs.filter((row) => row.level === 'error');
+  assert.equal(breakerLogs.length, 2, 'the trip must log one error row per paused campaign');
+
+  // Recovery: a healthy connection and an operator Run now clears the breaker
+  // (the warning disappears), without touching the other paused campaign.
+  failSends = false;
+  await breakerService.runNow(campaignA.id);
+  assert.equal(breakerService.getCircuitWarning(), null, 'an operator Run now must clear the account warning');
+  const [stillPausedB] = await db.select({ status: campaigns.status }).from(campaigns).where(eq(campaigns.id, campaignB.id));
+  assert.equal(stillPausedB.status, 'PAUSED', 'running one campaign again must not resume the others');
 });

@@ -1,5 +1,5 @@
 import makeWASocket, { Browsers, DisconnectReason, fetchLatestWaWebVersion, useMultiFileAuthState } from '@whiskeysockets/baileys';
-import type { WASocket } from '@whiskeysockets/baileys';
+import type { ConnectionState, WASocket } from '@whiskeysockets/baileys';
 import type { FastifyBaseLogger } from 'fastify';
 import QRCode from 'qrcode';
 import { existsSync, readFileSync } from 'node:fs';
@@ -11,7 +11,7 @@ import { db } from '../db/client.js';
 import { groups, whatsappAccounts } from '../db/schema.js';
 import { config } from '../config.js';
 import { ScannerService } from '../scanner/service.js';
-import { burstJoinDenied, dailyJoinDenied, JOIN_BURST, JOIN_DAILY_LIMIT, joinsInWindow, joinsToday, lastJoinAt, recordJoin, requiredJoinDelaySeconds } from '../safety/limits.js';
+import { burstJoinDenied, dailyJoinDenied, drawReconnectBackoffSeconds, JOIN_BURST, JOIN_DAILY_LIMIT, joinsInWindow, joinsToday, lastJoinAt, recordJoin, requiredJoinDelaySeconds } from '../safety/limits.js';
 
 export type WhatsAppStatus = {
   state: 'DISCONNECTED' | 'CONNECTING' | 'QR_READY' | 'CONNECTED' | 'LOGGED_OUT';
@@ -26,11 +26,26 @@ const wait = (milliseconds: number) => new Promise<void>((resolve) => setTimeout
 // A fallback is kept for an offline machine. The normal path obtains the
 // current public WhatsApp Web revision with a strict timeout before linking.
 const whatsappWebVersion: [number, number, number] = [2, 3000, 1043857760];
+// A stock, unbranded browser profile. The previous configuration sent a custom
+// "WA Group Control" app identity in the login node and device properties,
+// which no real browser would send; a plain Safari-on-macOS profile looks like
+// an ordinary WhatsApp Web link and removes the most obvious self-report.
+const whatsappBrowser = Browsers.macOS('Safari');
 
 export class WhatsAppManager {
   private socket: WASocket | null = null;
   private connectPromise: Promise<void> | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  // Consecutive unrequested connection closes, keyed into the reconnect backoff
+  // ladder (safety/limits.ts). Reset by any successful open or manual action.
+  private consecutiveCloses = 0;
+  // Set when WhatsApp actively refused the session (403): the next Link action
+  // must start a fresh QR flow instead of reusing the refused credentials.
+  private needsFreshLink = false;
+  // Set by relink(true): the immediately following connect must not resurrect
+  // a stored session from a backup, or a rejected session could never be
+  // replaced by a new pairing.
+  private skipRestoreNextConnect = false;
   private requestedDisconnect = false;
   private status: WhatsAppStatus = { state: 'DISCONNECTED', phone: null, lastConnectedAt: null, qrDataUrl: null, error: null };
   private listeners = new Set<(status: WhatsAppStatus) => void>();
@@ -40,14 +55,18 @@ export class WhatsAppManager {
   // restart can restore this copy if an interrupted process leaves the live
   // folder incomplete.
   private readonly authBackupDir: string;
+  // Older local builds kept one flat backup folder for the main account.
+  // Reading it (in addition to the per-account folder) keeps sessions
+  // recoverable after an upgrade without forcing a new QR pairing.
+  private readonly legacyAuthBackupDir: string | null;
   private authSnapshotPromise: Promise<void> = Promise.resolve();
-  // Serializes join attempts (auto-join and manual joins share this queue).
+  // Serializes manual join attempts so pacing limits always hold across them.
   private joinQueue: Promise<void> = Promise.resolve();
 
   public constructor(private readonly logger: FastifyBaseLogger, private readonly scanner: ScannerService, authDir = config.WHATSAPP_AUTH_DIR, private readonly accountId = 'main') {
     this.authDir = authDir;
     this.authBackupDir = resolve(dirname(config.DATABASE_PATH), 'whatsapp-auth-backups', accountId);
-    scanner.setAutoJoinHandler(async (inviteCode) => { await this.joinGroup(inviteCode); });
+    this.legacyAuthBackupDir = accountId === 'main' ? resolve(dirname(config.DATABASE_PATH), 'whatsapp-auth-backup') : null;
   }
 
   public getStatus(): WhatsAppStatus { return { ...this.status }; }
@@ -59,6 +78,12 @@ export class WhatsAppManager {
   }
   public hasSavedSession(): boolean {
     return this.hasSavedSessionAt(this.authDir);
+  }
+
+  /** True when a valid session can be recovered from a backup folder. */
+  public hasRecoverableSession(): boolean {
+    if (this.hasSavedSessionAt(this.authBackupDir)) return true;
+    return this.legacyAuthBackupDir !== null && this.hasSavedSessionAt(this.legacyAuthBackupDir);
   }
 
   private hasSavedSessionAt(directory: string): boolean {
@@ -87,13 +112,24 @@ export class WhatsAppManager {
   }
 
   public requestLink(): WhatsAppStatus {
+    // The button is hidden while connected, but a stale client or a double
+    // click must never open a second session alongside the live one.
+    if (this.status.state === 'CONNECTED') return this.getStatus();
     const priorState = this.status.state;
+    // A deliberate human action restarts the backoff ladder: a manual link or
+    // reconnect must never inherit the escalating penalty of the automatic one.
+    this.consecutiveCloses = 0;
     this.setStatus({ state: 'CONNECTING', qrDataUrl: null, error: null });
-    // A normal refresh/reconnect always reuses the saved session. Only a
-    // deliberate Link WhatsApp action after WhatsApp itself has rejected the
-    // session is allowed to start a fresh QR flow.
-    const link = priorState === 'LOGGED_OUT' || !this.hasSavedSession()
-      ? this.relink(true)
+    // A normal refresh/reconnect always reuses the saved session (restoring it
+    // from a backup when the live folder is empty). Only a deliberate Link
+    // action after WhatsApp rejected the session, or when nothing recoverable
+    // exists, is allowed to start a fresh QR flow. A QR already on screen
+    // means a pending, unpaired socket: it is closed first, without deleting
+    // any stored credentials.
+    const mustRelink = priorState === 'LOGGED_OUT' || this.needsFreshLink
+      || (!this.hasSavedSession() && !this.hasRecoverableSession());
+    const link = mustRelink ? this.relink(true)
+      : priorState === 'QR_READY' ? this.relink(false)
       : this.start();
     void link.catch((error: unknown) => {
       this.setStatus({ state: 'DISCONNECTED', error: 'Could not begin WhatsApp linking. Try again.' });
@@ -116,49 +152,79 @@ export class WhatsAppManager {
 
   private async connect(): Promise<void> {
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
-    await this.restoreAuthBackupIfNeeded();
-    await mkdir(this.authDir, { recursive: true });
-    this.setStatus({ state: 'CONNECTING', qrDataUrl: null, error: null });
-    const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
-    const version = await this.getCompatibleWebVersion();
-    const socket = makeWASocket({
-      version,
-      auth: state,
-      printQRInTerminal: false,
-      browser: Browsers.ubuntu('WA Group Control'),
-      markOnlineOnConnect: false,
-      syncFullHistory: false,
-      logger: this.logger as never,
-      generateHighQualityLinkPreview: false,
-    });
-    this.socket = socket;
-    socket.ev.on('creds.update', () => {
-      void saveCreds().then(() => this.queueAuthSnapshot()).catch((error: unknown) => {
-        this.logger.error({ err: error }, 'Unable to save WhatsApp credentials');
+    try {
+      // relink(true) asks for a fresh pairing: that connect must not resurrect
+      // a rejected session from a backup.
+      if (!this.skipRestoreNextConnect) await this.restoreAuthBackupIfNeeded();
+      this.skipRestoreNextConnect = false;
+      await mkdir(this.authDir, { recursive: true });
+      this.setStatus({ state: 'CONNECTING', qrDataUrl: null, error: null });
+      const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
+      const version = await this.getCompatibleWebVersion();
+      const socket = makeWASocket({
+        version,
+        auth: state,
+        printQRInTerminal: false,
+        browser: whatsappBrowser,
+        markOnlineOnConnect: false,
+        syncFullHistory: false,
+        logger: this.logger as never,
+        generateHighQualityLinkPreview: false,
       });
-    });
-    socket.ev.on('messages.upsert', ({ type, messages }) => {
-      // Baileys emits history and local echo events too. The scanner only acts
-      // on newly delivered inbound group messages.
-      if (type !== 'notify') return;
-      for (const message of messages) {
-        void this.scanner.processIncomingMessage(message).catch((error: unknown) => {
-          this.logger.error({ err: error, groupJid: message.key.remoteJid }, 'Unable to process incoming group message for invite links');
+      this.socket = socket;
+      socket.ev.on('creds.update', () => {
+        void saveCreds().then(() => this.queueAuthSnapshot()).catch((error: unknown) => {
+          this.logger.error({ err: error }, 'Unable to save WhatsApp credentials');
         });
-      }
-    });
-    socket.ev.on('connection.update', async (update) => {
+      });
+      socket.ev.on('messages.upsert', ({ type, messages }) => {
+        // Baileys emits history and local echo events too. The scanner only acts
+        // on newly delivered inbound group messages.
+        if (type !== 'notify') return;
+        for (const message of messages) {
+          void this.scanner.processIncomingMessage(message).catch((error: unknown) => {
+            this.logger.error({ err: error, groupJid: message.key.remoteJid }, 'Unable to process incoming group message for invite links');
+          });
+        }
+      });
+      socket.ev.on('connection.update', (update) => {
+        // One async handler that never rejects: a throwing handler here would
+        // be an unhandled rejection that kills the whole API process.
+        void this.handleConnectionUpdate(socket, update);
+      });
+    } catch (error) {
+      // A failed open (disk trouble, offline version registry, …) must never
+      // escape start() into an unhandled rejection, and must never retry in a
+      // tight loop: the same backoff ladder as a dropped connection applies.
+      this.socket = null;
+      this.logger.error({ err: error }, 'Unable to open the WhatsApp connection');
+      this.setStatus({ state: 'DISCONNECTED', qrDataUrl: null, error: 'Could not open WhatsApp. Check the internet connection, then press Link WhatsApp.' });
+      if (!this.requestedDisconnect) this.scheduleReconnect();
+    }
+  }
+
+  /** Handle one connection.update event without ever throwing into the event loop. */
+  private async handleConnectionUpdate(socket: WASocket, update: Partial<ConnectionState>): Promise<void> {
+    try {
       if (update.qr) {
         this.setStatus({ state: 'QR_READY', qrDataUrl: await QRCode.toDataURL(update.qr), error: null });
         this.logger.info('WhatsApp QR is ready for local linking');
       }
       if (update.connection === 'open') {
+        this.consecutiveCloses = 0;
+        this.needsFreshLink = false;
         const phone = socket.user?.id?.split(':')[0] ?? null;
         this.setStatus({ state: 'CONNECTED', phone, lastConnectedAt: now(), qrDataUrl: null, error: null });
-        if (phone) await db.update(whatsappAccounts).set({ phone, updatedAt: now() }).where(eq(whatsappAccounts.id, this.accountId));
         this.logger.info({ phone }, 'WhatsApp connected');
+        try {
+          if (phone) await db.update(whatsappAccounts).set({ phone, updatedAt: now() }).where(eq(whatsappAccounts.id, this.accountId));
+          await this.syncGroups();
+        } catch (error) {
+          // Group fetch or settings writes must never take down a working
+          // connection, or the process.
+          this.logger.warn({ err: error }, 'Connected, but the initial group sync failed');
+        }
         void this.queueAuthSnapshot();
-        await this.syncGroups();
       }
       if (update.connection === 'close') {
         // A previous socket can close after a fresh relink has begun. Its
@@ -176,11 +242,40 @@ export class WhatsAppManager {
           this.logger.warn('WhatsApp session logged out');
           return;
         }
-        this.setStatus({ state: 'DISCONNECTED', qrDataUrl: null, error: 'Connection lost; reconnecting.' });
-        this.logger.warn({ code }, 'WhatsApp disconnected; scheduling reconnect');
-        this.reconnectTimer = setTimeout(() => void this.start(), 3_000);
+        // A 403 means WhatsApp actively refused the session (typically a
+        // restricted or banned number). Reconnecting into it automatically
+        // would only reinforce the restriction, so stop, and make the next
+        // Link action start a fresh pairing instead of reusing it.
+        if (code === DisconnectReason.forbidden) {
+          this.needsFreshLink = true;
+          this.setStatus({ state: 'DISCONNECTED', qrDataUrl: null, error: 'WhatsApp refused the connection (403). The number may be restricted. Automatic reconnects are stopped; use the phone normally for a while before relinking.' });
+          this.logger.warn({ code }, 'WhatsApp refused the connection; automatic reconnect stopped');
+          return;
+        }
+        this.scheduleReconnect();
       }
-    });
+    } catch (error) {
+      this.logger.error({ err: error }, 'Error while handling a WhatsApp connection update');
+    }
+  }
+
+  /**
+   * Escalate the wait with every consecutive unrequested close (frozen tiers,
+   * see safety/limits.ts) so a rejected or restricted session is never
+   * hammered by automatic reconnect attempts.
+   */
+  private scheduleReconnect(): void {
+    this.consecutiveCloses += 1;
+    const backoffSeconds = drawReconnectBackoffSeconds(this.consecutiveCloses);
+    if (backoffSeconds === null) {
+      this.setStatus({ state: 'DISCONNECTED', qrDataUrl: null, error: 'Connection lost repeatedly; automatic reconnect stopped. Press Link WhatsApp to reconnect.' });
+      this.logger.warn({ closes: this.consecutiveCloses }, 'WhatsApp disconnected repeatedly; automatic reconnect stopped');
+      return;
+    }
+    const waitLabel = backoffSeconds < 60 ? `${backoffSeconds} seconds` : `about ${Math.round(backoffSeconds / 60)} minutes`;
+    this.setStatus({ state: 'DISCONNECTED', qrDataUrl: null, error: `Connection lost; reconnecting in ${waitLabel}.` });
+    this.logger.warn({ closes: this.consecutiveCloses, backoffSeconds }, 'WhatsApp disconnected; scheduling reconnect');
+    this.reconnectTimer = setTimeout(() => void this.start(), backoffSeconds * 1_000);
   }
 
   public async syncGroups(): Promise<number> {
@@ -230,6 +325,8 @@ export class WhatsAppManager {
 
   public async disconnect(): Promise<void> {
     this.requestedDisconnect = true;
+    // A deliberate disconnect is not part of the automatic-close streak.
+    this.consecutiveCloses = 0;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     const socket = this.socket;
     this.socket = null;
@@ -243,13 +340,14 @@ export class WhatsAppManager {
 
   public async relink(clearRejectedSession = false): Promise<void> {
     await this.disconnect();
-    // Do not delete credentials during an ordinary reconnect. If WhatsApp has
-    // explicitly rejected the session and the user presses Link WhatsApp,
-    // clear only the live copy so a new QR can be generated; the last known
-    // good copy is kept as a recovery record. A deliberate fresh QR flow is
-    // the exception: WhatsApp has already rejected that session, so remove
-    // both copies to prevent restoring the same rejected credentials.
+    // Do not delete credentials during an ordinary reconnect. A deliberate
+    // fresh QR flow is the exception: WhatsApp has already rejected the
+    // session, so the live and per-account backup copies are removed to
+    // prevent restoring the same rejected credentials, and the next connect
+    // skips backup restoration entirely. The legacy backup folder is left
+    // untouched as a last-resort recovery record.
     if (clearRejectedSession) {
+      this.skipRestoreNextConnect = true;
       await rm(this.authDir, { recursive: true, force: true });
       await rm(this.authBackupDir, { recursive: true, force: true });
     }
@@ -257,10 +355,16 @@ export class WhatsAppManager {
   }
 
   private async restoreAuthBackupIfNeeded(): Promise<void> {
-    if (this.hasSavedSession() || !this.hasSavedSessionAt(this.authBackupDir)) return;
-    await rm(this.authDir, { recursive: true, force: true });
-    await cp(this.authBackupDir, this.authDir, { recursive: true, force: true });
-    this.logger.info('Restored saved WhatsApp session from local backup');
+    if (this.hasSavedSession()) return;
+    const candidates = [this.authBackupDir];
+    if (this.legacyAuthBackupDir) candidates.push(this.legacyAuthBackupDir);
+    for (const candidate of candidates) {
+      if (!this.hasSavedSessionAt(candidate)) continue;
+      await rm(this.authDir, { recursive: true, force: true });
+      await cp(candidate, this.authDir, { recursive: true, force: true });
+      this.logger.info({ from: candidate }, 'Restored saved WhatsApp session from local backup');
+      return;
+    }
   }
 
   private queueAuthSnapshot(): Promise<void> {

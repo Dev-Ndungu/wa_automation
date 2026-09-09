@@ -5,8 +5,8 @@ import type { FastifyBaseLogger } from 'fastify';
 import sharp from 'sharp';
 import { db } from '../db/client.js';
 import { campaignSources, campaignTargets, campaigns, groups, operationalLogs, sourceMessages } from '../db/schema.js';
-import type { WhatsAppManager } from '../whatsapp/manager.js';
-import { drawCampaignWarmupSeconds, drawGroupCooldownMs, drawGroupGraceMs, drawSendGapSeconds, GROUP_COOLDOWN, recordSend, SEND_DAILY_LIMIT, SEND_GAP, sendsToday } from '../safety/limits.js';
+import type { WhatsAppManager, WhatsAppStatus } from '../whatsapp/manager.js';
+import { CIRCUIT_BREAKER_CONSECUTIVE_FAILURES, drawCampaignWarmupSeconds, drawGroupCooldownMs, drawGroupGraceMs, drawReconnectSettleSeconds, drawSendGapSeconds, GROUP_COOLDOWN, recordSend, SEND_DAILY_LIMIT, SEND_GAP, sendsToday } from '../safety/limits.js';
 import { canDeliverTarget, cooldownWarnings, type CampaignSchedule, validateExplicitTargets, validateSchedule } from './policy.js';
 
 const now = () => new Date().toISOString();
@@ -15,7 +15,7 @@ const wait = (milliseconds: number) => new Promise<void>((resolve) => setTimeout
 /**
  * Where pacing comes from while a campaign runs. Production uses the frozen
  * random draws from safety/limits.ts (DEFAULT_PACING); tests inject instant,
- * deterministic pacing here so a suite never waits out real 45-180s gaps.
+ * deterministic pacing here so a suite never waits out real 60-240s gaps.
  */
 export type CampaignPacing = {
   /** Account-wide floor between any two sends, applied by the serial queue. */
@@ -24,12 +24,19 @@ export type CampaignPacing = {
   sendGapSeconds: () => number;
   /** One-time wait when a campaign run starts. */
   warmupSeconds: () => number;
+  /**
+   * Quiet window after the connection returns (or is first established) before
+   * the account sends anything: drawn once per CONNECTED-after-other
+   * transition and applied to the first send through the serial queue.
+   */
+  reconnectSettleMs: () => number;
 };
 
 export const DEFAULT_PACING: CampaignPacing = {
   minSendGapSeconds: SEND_GAP.minSeconds,
   sendGapSeconds: drawSendGapSeconds,
   warmupSeconds: drawCampaignWarmupSeconds,
+  reconnectSettleMs: () => drawReconnectSettleSeconds() * 1_000,
 };
 
 type CampaignStatus = 'DRAFT' | 'QUEUED' | 'RUNNING' | 'PAUSED' | 'COMPLETED' | 'STOPPED' | 'FAILED';
@@ -134,9 +141,29 @@ export class CampaignService {
   // sends holds across concurrent campaigns, not just inside one campaign.
   private accountSendQueue: Promise<void> = Promise.resolve();
   private lastSendAtMs = 0;
+  // After the connection returns, sends stay gated until this wall-clock time.
+  // Drawn once per reconnect (see the constructor subscription) so the account
+  // sits quiet on the server side while the freshly resumed session settles.
+  private settleUntilMs: number | null = null;
+  private lastConnectionState: WhatsAppStatus['state'] | null = null;
+  // Account-level circuit breaker: consecutive send failures trip it, pausing
+  // every running campaign until an operator acts (see tripCircuitBreaker).
+  private consecutiveSendFailures = 0;
+  private circuitOpen = false;
 
   public constructor(private readonly whatsapp: WhatsAppManager, private readonly logger: FastifyBaseLogger, private readonly accountId = 'main', private readonly pacing: CampaignPacing = DEFAULT_PACING) {
+    // A reconnect (or a first connect after boot) is treated as the account
+    // coming back online, so every send waits out one quiet window. Status
+    // events only fire on change, and the manager is always pre-start when this
+    // service subscribes, so the first open of the process is observed too.
+    this.lastConnectionState = this.whatsapp.getStatus().state;
     this.whatsapp.subscribe((status) => {
+      if (status.state === 'CONNECTED' && this.lastConnectionState !== 'CONNECTED') {
+        const settleMs = this.pacing.reconnectSettleMs();
+        this.settleUntilMs = Date.now() + settleMs;
+        this.logger.info({ accountId, settleSeconds: Math.round(settleMs / 1_000) }, 'WhatsApp connected; sends are gated until the settle window passes');
+      }
+      this.lastConnectionState = status.state;
       if (status.state === 'CONNECTED') void this.resumeRunningWorkers();
     });
     this.whatsapp.subscribeGroupJoined((group) => this.addJoinedGroupToCampaigns(group));
@@ -406,6 +433,13 @@ export class CampaignService {
 
   public async start(id: string) {
     const campaign = await this.requireStatus(id, ['DRAFT', 'QUEUED', 'PAUSED']);
+    // An operator deliberately (re)starting a campaign clears the account
+    // circuit breaker: they have chosen to retry, so failures count fresh.
+    this.circuitOpen = false;
+    this.consecutiveSendFailures = 0;
+    // Heal rows that an older build left stuck in SENDING (a paused campaign
+    // has no in-flight send, so releasing them cannot double-send).
+    await this.releaseStuckSendingRows(id);
     const startedAt = now();
     const schedule = storedSchedule(campaign.scheduleConfig, campaign.dailyRunTime);
     const nextRunAt = schedule.type !== 'ONCE'
@@ -422,6 +456,9 @@ export class CampaignService {
   public async runNow(id: string) {
     const [campaign] = await db.select().from(campaigns).where(and(eq(campaigns.id, id), eq(campaigns.accountId, this.accountId))).limit(1);
     if (!campaign) throw new Error('Campaign not found.');
+    // Same operator-action semantics as start(): retrying is a fresh start.
+    this.circuitOpen = false;
+    this.consecutiveSendFailures = 0;
     if (campaign.status === 'STOPPED' || campaign.status === 'COMPLETED') {
       await db.update(campaignTargets).set({ status: 'QUEUED', scheduledAt: null, sentAt: null, errorMessage: null, attemptCount: 0 })
         .where(eq(campaignTargets.campaignId, id));
@@ -509,9 +546,18 @@ export class CampaignService {
 
   public async resume(id: string) {
     await this.requireStatus(id, ['PAUSED']);
+    // A paused campaign has no in-flight send: rows an older build left stuck
+    // in SENDING are released back to the queue instead of blocking forever.
+    await this.releaseStuckSendingRows(id);
     await db.update(campaigns).set({ status: 'RUNNING', pauseReason: null }).where(eq(campaigns.id, id));
     this.runWorker(id);
     return this.get(id);
+  }
+
+  /** Reset rows stranded in SENDING by a crashed process or an older build. */
+  private async releaseStuckSendingRows(id: string): Promise<void> {
+    await db.update(campaignTargets).set({ status: 'QUEUED', errorMessage: null })
+      .where(and(eq(campaignTargets.campaignId, id), eq(campaignTargets.status, 'SENDING')));
   }
 
   public async stop(id: string) {
@@ -698,6 +744,12 @@ export class CampaignService {
           .where(eq(campaignTargets.id, target.id));
         continue;
       }
+      // Enforce the daily send budget before the row is claimed, so a paused
+      // campaign never leaves a target stuck in SENDING forever.
+      if (await sendsToday(this.accountId) >= SEND_DAILY_LIMIT) {
+        await this.pauseForDailyBudget(id);
+        return;
+      }
       await db.update(campaignTargets).set({ status: 'SENDING', attemptCount: target.attemptCount + 1, errorMessage: null })
         .where(and(eq(campaignTargets.id, target.id), ne(campaignTargets.status, 'SENT')));
       // Consume the warm-up set by start()/runNow() once per worker pass, in
@@ -711,6 +763,21 @@ export class CampaignService {
           remainingMs -= Math.min(remainingMs, 60_000);
         }
       }
+      // A pause/stop/disconnect that arrived during the warm-up (or while
+      // loading sources) must abort this delivery and release the row.
+      const [fresh] = await db.select({ status: campaigns.status }).from(campaigns)
+        .where(and(eq(campaigns.id, id), eq(campaigns.accountId, this.accountId))).limit(1);
+      if (!fresh || fresh.status !== 'RUNNING') {
+        await db.update(campaignTargets).set({
+          status: fresh?.status === 'STOPPED' ? 'CANCELLED' : 'QUEUED',
+          errorMessage: fresh?.status === 'STOPPED' ? 'Campaign was stopped before this send.' : null,
+        }).where(eq(campaignTargets.id, target.id));
+        return;
+      }
+      if (this.whatsapp.getStatus().state !== 'CONNECTED') {
+        await db.update(campaignTargets).set({ status: 'QUEUED', errorMessage: null }).where(eq(campaignTargets.id, target.id));
+        return;
+      }
       // Hoisted so the catch below can use it if loading the sources throws.
       let sources: Array<{ id: string; payload: string }> = [];
       try {
@@ -720,10 +787,12 @@ export class CampaignService {
         for (const source of sources) {
           // Enforce the daily send budget per message. A campaign that hits the
           // limit mid-file pauses itself so nothing further goes out until the
-          // daily budget resets (UTC midnight) and the campaign is resumed.
+          // daily budget resets (UTC midnight) and the campaign is resumed. The
+          // target is released back to QUEUED, never left SENDING.
           if (await sendsToday(this.accountId) >= SEND_DAILY_LIMIT) {
-            await db.update(campaigns).set({ status: 'PAUSED', pauseReason: `Daily send limit reached (${SEND_DAILY_LIMIT} messages). Resume after UTC midnight for the budget to reset.` }).where(eq(campaigns.id, id));
-            await db.insert(operationalLogs).values({ id: randomUUID(), level: 'warn', event: 'campaign.auto_paused', details: JSON.stringify({ campaignId: id }), createdAt: now() });
+            await db.update(campaignTargets).set({ status: 'QUEUED', errorMessage: 'Daily send budget reached; queued for the next run.' })
+              .where(eq(campaignTargets.id, target.id));
+            await this.pauseForDailyBudget(id);
             return;
           }
           const content: unknown = JSON.parse(source.payload);
@@ -771,12 +840,19 @@ export class CampaignService {
         await db.update(campaignTargets).set({ status: 'SENT', sentAt, errorMessage: null })
           .where(and(eq(campaignTargets.id, target.id), ne(campaignTargets.status, 'SENT')));
         await db.update(groups).set({ lastCampaignSentAt: sentAt, updatedAt: sentAt }).where(and(eq(groups.accountId, this.accountId), eq(groups.whatsappGroupJid, target.groupJid)));
+        // A real delivery proves the connection works: the failure streak is over.
+        this.consecutiveSendFailures = 0;
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Unknown delivery error';
         await db.update(campaignTargets).set({ status: 'FAILED', errorMessage: message.slice(0, 500) }).where(eq(campaignTargets.id, target.id));
         // A failed send still yields a random gap before the next group is
         // attempted, so a failing run cannot speed up into a detectable
         // pattern.
+        // Consecutive failures count toward the account circuit breaker. Any
+        // single success resets the count, so only an unbroken failing run
+        // (a dead connection, a restricted account) pauses the campaigns.
+        this.consecutiveSendFailures += 1;
+        if (this.consecutiveSendFailures >= CIRCUIT_BREAKER_CONSECUTIVE_FAILURES) await this.tripCircuitBreaker();
         await wait(this.pacing.sendGapSeconds() * 1_000);
       }
     }
@@ -788,13 +864,17 @@ export class CampaignService {
    * racing to send cannot both wait out the gap and then fire together: each
    * consecutive account send ends up at least minSendGapSeconds apart. Random
    * pacing between messages happens in the worker; this queue only enforces
-   * the hard floor.
+   * the hard floor. A reconnect settle window, when one is active, gates every
+   * send on top of the gap (it only ever delays the first send after a
+   * reconnect, because it has expired by the time any later send runs).
    * A send that throws rejects the returned promise (the caller marks the
    * target FAILED) without breaking the queue for later sends.
    */
   private enqueueAccountSend(send: () => Promise<void>, minGapMs: number): Promise<void> {
     const next = this.accountSendQueue.then(async () => {
-      const remaining = minGapMs - (Date.now() - this.lastSendAtMs);
+      const nowMs = Date.now();
+      const settleRemainingMs = this.settleUntilMs === null ? 0 : this.settleUntilMs - nowMs;
+      const remaining = Math.max(settleRemainingMs, minGapMs - (nowMs - this.lastSendAtMs));
       if (remaining > 0) await wait(remaining);
       await send();
       this.lastSendAtMs = Date.now();
@@ -802,6 +882,47 @@ export class CampaignService {
     });
     this.accountSendQueue = next.then(() => undefined, () => undefined);
     return next;
+  }
+
+  /**
+   * Pause a campaign because the account-wide daily send budget is spent. The
+   * pause is durable (status + pauseReason) so a restart cannot silently
+   * resume it, and the worker is woken so the pause takes effect immediately.
+   */
+  private async pauseForDailyBudget(id: string): Promise<void> {
+    await db.update(campaigns).set({ status: 'PAUSED', pauseReason: `Daily send limit reached (${SEND_DAILY_LIMIT} messages). Resume after UTC midnight for the budget to reset.` }).where(eq(campaigns.id, id));
+    await db.insert(operationalLogs).values({ id: randomUUID(), level: 'warn', event: 'campaign.auto_paused', details: JSON.stringify({ campaignId: id, reason: 'daily_budget' }), createdAt: now() });
+    this.wakeWorker(id);
+  }
+
+  /**
+   * Pause every running campaign of the account after an unbroken run of send
+   * failures. The pause is durable (status + pauseReason, like the daily-limit
+   * auto-pause) so a restart cannot silently resume a campaign whose account
+   * keeps failing; workers are woken so paused campaigns stop immediately.
+   * Recovery is an operator action: Run again resumes the remaining queue, or
+   * Stop then Run retries the failed sends. start()/runNow() clear the breaker.
+   */
+  private async tripCircuitBreaker(): Promise<void> {
+    this.circuitOpen = true;
+    const reason = `Paused automatically after ${CIRCUIT_BREAKER_CONSECUTIVE_FAILURES} consecutive send failures. Check the WhatsApp connection, then Run the campaign again to continue, or Stop then Run to retry failed sends.`;
+    const running = await db.select({ id: campaigns.id }).from(campaigns)
+      .where(and(eq(campaigns.accountId, this.accountId), eq(campaigns.status, 'RUNNING')));
+    for (const campaign of running) {
+      await db.update(campaigns).set({ status: 'PAUSED', pauseReason: reason }).where(eq(campaigns.id, campaign.id));
+      await db.insert(operationalLogs).values({
+        id: randomUUID(), level: 'error', event: 'campaign.auto_paused',
+        details: JSON.stringify({ campaignId: campaign.id, reason: 'circuit_breaker' }), createdAt: now(),
+      });
+      this.wakeWorker(campaign.id);
+    }
+    this.logger.error({ accountId: this.accountId, paused: running.length }, 'Circuit breaker tripped: pausing every running campaign after consecutive send failures');
+  }
+
+  /** Banner text for the dashboard while the account circuit breaker is open. */
+  public getCircuitWarning(): string | null {
+    if (!this.circuitOpen) return null;
+    return `Sends failed ${CIRCUIT_BREAKER_CONSECUTIVE_FAILURES} times in a row, so every running campaign was paused. Check the WhatsApp connection, then Run a campaign again to continue or Stop then Run to retry failed sends.`;
   }
 
   private async requireStatus(id: string, allowed: CampaignStatus[]) {

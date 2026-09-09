@@ -29,7 +29,14 @@ export class AccountService {
     for (const account of accounts) {
       const runtime = this.createRuntime(account.id);
       await runtime.campaigns.recover();
-      if (runtime.whatsapp.hasSavedSession()) void runtime.whatsapp.start();
+      // Start whenever a session exists — live or recoverable from a local
+      // backup — so an interrupted process or a cleared live folder does not
+      // silently lose the pairing and force a new QR scan.
+      if (runtime.whatsapp.hasSavedSession() || runtime.whatsapp.hasRecoverableSession()) {
+        void runtime.whatsapp.start().catch((error: unknown) => {
+          this.logger.warn({ err: error, accountId: account.id }, 'Unable to start WhatsApp connection on boot');
+        });
+      }
     }
   }
 
