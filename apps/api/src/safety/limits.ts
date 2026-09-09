@@ -13,26 +13,50 @@ import { actionLog } from '../db/schema.js';
  */
 
 /** Random wait between consecutive group joins. */
-export const JOIN_PACING = { minSeconds: 60, maxSeconds: 180 };
+export const JOIN_PACING = { minSeconds: 120, maxSeconds: 300 };
 
 /** Hard caps on joins: a burst window and a per-day total. */
-export const JOIN_BURST = { limit: 3, windowMinutes: 120 };
-export const JOIN_DAILY_LIMIT = 6;
+export const JOIN_BURST = { limit: 2, windowMinutes: 180 };
+export const JOIN_DAILY_LIMIT = 3;
 
 /** Random wait between consecutive message sends, drawn per message. */
-export const SEND_GAP = { minSeconds: 45, maxSeconds: 180 };
+export const SEND_GAP = { minSeconds: 60, maxSeconds: 240 };
 
 /** Random cooldown after a group received a campaign, drawn once per parking. */
-export const GROUP_COOLDOWN = { minHours: 12, maxHours: 36 };
+export const GROUP_COOLDOWN = { minHours: 18, maxHours: 48 };
 
 /** Random grace for a freshly joined group before its first campaign send. */
-export const NEW_GROUP_GRACE = { minMinutes: 90, maxMinutes: 240 };
+export const NEW_GROUP_GRACE = { minMinutes: 120, maxMinutes: 360 };
 
 /** Random one-time warm-up when a campaign run starts. */
 export const CAMPAIGN_WARMUP = { minSeconds: 30, maxSeconds: 120 };
 
-/** Hard cap on campaign sends per account per UTC day. */
-export const SEND_DAILY_LIMIT = 80;
+/**
+ * Hard cap on campaign sends per account per UTC day. Kept deliberately
+ * conservative: sending to many groups every day is the classic restriction
+ * trigger, and a fresh number has no reputation to spend.
+ */
+export const SEND_DAILY_LIMIT = 30;
+
+/**
+ * Reconnect ladder after a connection closes: each consecutive close draws a
+ * fresh wait from the next, wider tier. The ladder has no final tier — when
+ * every tier is spent the next close stops auto-reconnect entirely until a
+ * human acts (see WhatsAppManager), so a restricted or rejected session can
+ * never be hammered by automatic reconnect attempts.
+ */
+export const RECONNECT_BACKOFF_TIERS = [
+  { minSeconds: 3, maxSeconds: 10 },
+  { minSeconds: 15, maxSeconds: 45 },
+  { minSeconds: 60, maxSeconds: 180 },
+  { minSeconds: 300, maxSeconds: 900 },
+];
+
+/** Random quiet window after a connection comes back, before any send resumes. */
+export const RECONNECT_SETTLE = { minSeconds: 120, maxSeconds: 300 };
+
+/** Consecutive failed sends that pause every running campaign of the account. */
+export const CIRCUIT_BREAKER_CONSECUTIVE_FAILURES = 5;
 
 const timestamp = (): string => new Date().toISOString();
 
@@ -79,6 +103,23 @@ export function drawGroupCooldownMs(rng: () => number = Math.random): number {
 export function drawGroupGraceMs(rng: () => number = Math.random): number {
   const minutes = NEW_GROUP_GRACE.minMinutes + rng() * (NEW_GROUP_GRACE.maxMinutes - NEW_GROUP_GRACE.minMinutes);
   return Math.floor(minutes * 60_000);
+}
+
+/**
+ * Seconds to wait before the streak-th consecutive reconnection attempt, drawn
+ * from the matching ladder tier. Returns null once every tier is spent, which
+ * tells the caller to stop auto-reconnecting (streak is 1-based: the first
+ * close draws from tier 0).
+ */
+export function drawReconnectBackoffSeconds(streak: number, rng: () => number = Math.random): number | null {
+  const tier = RECONNECT_BACKOFF_TIERS[streak - 1];
+  if (!tier) return null;
+  return drawInteger(tier.minSeconds, tier.maxSeconds, rng);
+}
+
+/** Uniform whole-second quiet window after a reconnect, from RECONNECT_SETTLE. */
+export function drawReconnectSettleSeconds(rng: () => number = Math.random): number {
+  return drawInteger(RECONNECT_SETTLE.minSeconds, RECONNECT_SETTLE.maxSeconds, rng);
 }
 
 /** Record a group join in action_log. groupJid is accepted for future use; action_log has no group column. */

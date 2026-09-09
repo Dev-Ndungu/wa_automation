@@ -85,10 +85,12 @@ test('burst and daily denial thresholds compare DB counts against the frozen lim
   assert.equal(burstJoinDenied(await joinsInWindow('main', JOIN_BURST.windowMinutes * 60_000)), true, `${JOIN_BURST.limit} joins in the window reach the frozen burst limit`);
   assert.equal(dailyJoinDenied(await joinsToday('main')), true, `${JOIN_DAILY_LIMIT} joins today reach the frozen daily limit`);
 
-  // Drop back under both limits: 2 in the window (burst limit 3) and 2 today.
-  await db.delete(actionLog).where(inArray(actionLog.id, inserted.slice(2)));
-  assert.equal(burstJoinDenied(await joinsInWindow('main', JOIN_BURST.windowMinutes * 60_000)), false, `${JOIN_BURST.limit - 1} joins in the window are below the frozen burst limit`);
-  assert.equal(dailyJoinDenied(await joinsToday('main')), false, `${JOIN_DAILY_LIMIT - 4} joins today are below the frozen daily limit`);
+  // Drop back under both limits: leave JOIN_BURST.limit - 1 joins in the
+  // window (below the burst limit), which is also below the daily limit.
+  const keepInWindow = JOIN_BURST.limit - 1;
+  await db.delete(actionLog).where(inArray(actionLog.id, inserted.slice(keepInWindow)));
+  assert.equal(burstJoinDenied(await joinsInWindow('main', JOIN_BURST.windowMinutes * 60_000)), false, `${keepInWindow} joins in the window are below the frozen burst limit`);
+  assert.equal(dailyJoinDenied(await joinsToday('main')), false, `${keepInWindow} joins today are below the frozen daily limit`);
 });
 
 test('bootstrap removes legacy per-account safety settings rows', async () => {

@@ -8,19 +8,15 @@ import { deduplicateInviteLinks, extractInviteLinks, type InviteLink } from './e
 import { extractMessageText } from './message-text.js';
 
 export const SCANNER_ENABLED_SETTING = 'scanner.enabled';
-export const AUTO_JOIN_ENABLED_SETTING = 'scanner.autoJoinEnabled';
 const timestamp = () => new Date().toISOString();
 
 export type LinkStatus = 'NEW' | 'VIEWED' | 'USED' | 'ARCHIVED';
 export type ListLinksOptions = { status?: LinkStatus; search?: string; groupJids?: string[]; since?: string; limit?: number; offset?: number };
 
 export class ScannerService {
-  private autoJoin: ((inviteCode: string) => Promise<void>) | null = null;
   public constructor(private readonly logger: FastifyBaseLogger, private readonly accountId = 'main') {}
 
   private settingKey(key: string): string { return `${this.accountId}.${key}`; }
-
-  public setAutoJoinHandler(handler: (inviteCode: string) => Promise<void>): void { this.autoJoin = handler; }
 
   public async isEnabled(): Promise<boolean> {
     const setting = await db.query.appSettings.findFirst({ where: eq(appSettings.key, this.settingKey(SCANNER_ENABLED_SETTING)) });
@@ -29,18 +25,6 @@ export class ScannerService {
 
   public async setEnabled(enabled: boolean): Promise<boolean> {
     const key = this.settingKey(SCANNER_ENABLED_SETTING);
-    await db.insert(appSettings).values({ key, value: String(enabled), updatedAt: timestamp() })
-      .onConflictDoUpdate({ target: appSettings.key, set: { value: String(enabled), updatedAt: timestamp() } });
-    return enabled;
-  }
-
-  public async isAutoJoinEnabled(): Promise<boolean> {
-    const setting = await db.query.appSettings.findFirst({ where: eq(appSettings.key, this.settingKey(AUTO_JOIN_ENABLED_SETTING)) });
-    return setting?.value === 'true';
-  }
-
-  public async setAutoJoinEnabled(enabled: boolean): Promise<boolean> {
-    const key = this.settingKey(AUTO_JOIN_ENABLED_SETTING);
     await db.insert(appSettings).values({ key, value: String(enabled), updatedAt: timestamp() })
       .onConflictDoUpdate({ target: appSettings.key, set: { value: String(enabled), updatedAt: timestamp() } });
     return enabled;
@@ -56,18 +40,16 @@ export class ScannerService {
     const links = deduplicateInviteLinks(extractMessageText(message).flatMap(extractInviteLinks));
     if (!links.length) return 0;
     const occurredAt = timestamp();
-    const autoJoinEnabled = await this.isAutoJoinEnabled();
+    // The scanner only records invite sightings. Joining a group is always an
+    // explicit human action (the Join button on a saved link): joining groups
+    // automatically is a classic restriction trigger, so no code path does it.
     for (const link of links) {
-      const record = await this.recordSighting(link, {
-      groupJid,
-      groupName: group.name,
-      messageId: message.key.id ?? null,
-      occurredAt,
-    });
-      if (autoJoinEnabled && record.isNew && this.autoJoin) {
-        try { await this.autoJoin(link.inviteCode); await this.deleteLink(record.id); }
-        catch (error) { this.logger.warn({ err: error, inviteUrl: link.inviteUrl }, 'Automatic group join failed'); }
-      }
+      await this.recordSighting(link, {
+        groupJid,
+        groupName: group.name,
+        messageId: message.key.id ?? null,
+        occurredAt,
+      });
     }
     this.logger.info({ groupJid, links: links.length }, 'WhatsApp group invite links discovered');
     return links.length;
