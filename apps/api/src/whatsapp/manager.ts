@@ -11,7 +11,7 @@ import { db } from '../db/client.js';
 import { groups, whatsappAccounts } from '../db/schema.js';
 import { config } from '../config.js';
 import { ScannerService } from '../scanner/service.js';
-import { burstJoinDenied, dailyJoinDenied, drawReconnectBackoffSeconds, JOIN_BURST, JOIN_DAILY_LIMIT, joinsInWindow, joinsToday, lastJoinAt, recordJoin, requiredJoinDelaySeconds } from '../safety/limits.js';
+import { burstJoinDenied, dailyJoinDenied, drawReconnectBackoffSeconds, JOIN_BURST, JOIN_DAILY_LIMIT, joinsInWindow, joinsToday, lastJoinAt, recordJoin, RECONNECT_BACKOFF_TIERS, requiredJoinDelaySeconds } from '../safety/limits.js';
 
 export type WhatsAppStatus = {
   state: 'DISCONNECTED' | 'CONNECTING' | 'QR_READY' | 'CONNECTED' | 'LOGGED_OUT';
@@ -46,6 +46,11 @@ export class WhatsAppManager {
   // a stored session from a backup, or a rejected session could never be
   // replaced by a new pairing.
   private skipRestoreNextConnect = false;
+  // True while the current socket has shown a pairing QR. A close in that
+  // state means the QR was never scanned (the server-issued refs simply ran
+  // out), which is benign: a fresh QR must follow quickly instead of burning
+  // the anti-restriction reconnect ladder on a session that never existed.
+  private qrWasShown = false;
   private requestedDisconnect = false;
   private status: WhatsAppStatus = { state: 'DISCONNECTED', phone: null, lastConnectedAt: null, qrDataUrl: null, error: null };
   private listeners = new Set<(status: WhatsAppStatus) => void>();
@@ -116,20 +121,26 @@ export class WhatsAppManager {
     // click must never open a second session alongside the live one.
     if (this.status.state === 'CONNECTED') return this.getStatus();
     const priorState = this.status.state;
+    // Remember whether the automatic reconnect ladder had already stopped
+    // before resetting it: a human click resets the ladder, but when every
+    // automatic attempt with the stored session already failed, the click
+    // must start a fresh QR instead of one more doomed round on it.
+    const reconnectLadderExhausted = this.consecutiveCloses >= RECONNECT_BACKOFF_TIERS.length;
     // A deliberate human action restarts the backoff ladder: a manual link or
     // reconnect must never inherit the escalating penalty of the automatic one.
     this.consecutiveCloses = 0;
     this.setStatus({ state: 'CONNECTING', qrDataUrl: null, error: null });
-    // A normal refresh/reconnect always reuses the saved session (restoring it
-    // from a backup when the live folder is empty). Only a deliberate Link
-    // action after WhatsApp rejected the session, or when nothing recoverable
-    // exists, is allowed to start a fresh QR flow. A QR already on screen
-    // means a pending, unpaired socket: it is closed first, without deleting
-    // any stored credentials.
-    const mustRelink = priorState === 'LOGGED_OUT' || this.needsFreshLink
-      || (!this.hasSavedSession() && !this.hasRecoverableSession());
-    const link = mustRelink ? this.relink(true)
-      : priorState === 'QR_READY' ? this.relink(false)
+    // A normal refresh/reconnect reuses the saved session (restoring it from
+    // a backup when the live folder is empty). A fresh QR flow starts when
+    // WhatsApp rejected the session, when no linked session exists anywhere,
+    // when a QR is already on screen, or when the stored session has already
+    // demonstrably failed (the reconnect ladder was exhausted). In the
+    // non-rejected fresh-QR cases the backups are kept: only the live folder
+    // is cleared, so a stored session can never steal the requested QR.
+    const rejected = priorState === 'LOGGED_OUT' || this.needsFreshLink;
+    const freshQr = rejected || !this.hasSavedSession() || priorState === 'QR_READY' || reconnectLadderExhausted;
+    if (!freshQr) this.skipRestoreNextConnect = false;
+    const link = freshQr ? this.relink(rejected || !this.hasRecoverableSession(), true)
       : this.start();
     void link.catch((error: unknown) => {
       this.setStatus({ state: 'DISCONNECTED', error: 'Could not begin WhatsApp linking. Try again.' });
@@ -153,14 +164,17 @@ export class WhatsAppManager {
   private async connect(): Promise<void> {
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
     try {
-      // relink(true) asks for a fresh pairing: that connect must not resurrect
-      // a rejected session from a backup.
+      // A fresh pairing request (relink) asks this connect to not resurrect a
+      // stored session from a backup. The flag stays set until the socket
+      // actually opens: an automatic reconnect after an unscanned QR expired
+      // must regenerate a QR instead of stealing the requested pairing with
+      // an old backup session.
       if (!this.skipRestoreNextConnect) await this.restoreAuthBackupIfNeeded();
-      this.skipRestoreNextConnect = false;
       await mkdir(this.authDir, { recursive: true });
       this.setStatus({ state: 'CONNECTING', qrDataUrl: null, error: null });
       const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
       const version = await this.getCompatibleWebVersion();
+      this.qrWasShown = false;
       const socket = makeWASocket({
         version,
         auth: state,
@@ -207,12 +221,16 @@ export class WhatsAppManager {
   private async handleConnectionUpdate(socket: WASocket, update: Partial<ConnectionState>): Promise<void> {
     try {
       if (update.qr) {
+        this.qrWasShown = true;
         this.setStatus({ state: 'QR_READY', qrDataUrl: await QRCode.toDataURL(update.qr), error: null });
         this.logger.info('WhatsApp QR is ready for local linking');
       }
       if (update.connection === 'open') {
+        this.qrWasShown = false;
         this.consecutiveCloses = 0;
         this.needsFreshLink = false;
+        // The fresh pairing completed: backup restoration is allowed again.
+        this.skipRestoreNextConnect = false;
         const phone = socket.user?.id?.split(':')[0] ?? null;
         this.setStatus({ state: 'CONNECTED', phone, lastConnectedAt: now(), qrDataUrl: null, error: null });
         this.logger.info({ phone }, 'WhatsApp connected');
@@ -250,6 +268,18 @@ export class WhatsAppManager {
           this.needsFreshLink = true;
           this.setStatus({ state: 'DISCONNECTED', qrDataUrl: null, error: 'WhatsApp refused the connection (403). The number may be restricted. Automatic reconnects are stopped; use the phone normally for a while before relinking.' });
           this.logger.warn({ code }, 'WhatsApp refused the connection; automatic reconnect stopped');
+          return;
+        }
+        // The socket only ever showed a pairing QR: the server-issued refs ran
+        // out before anyone scanned. That is not a failing session and must
+        // not escalate the reconnect ladder (or stop it after a few rounds).
+        // Regenerate a fresh QR after a short pause and keep doing so until
+        // the phone actually scans one — an on-screen QR is then always live.
+        if (this.qrWasShown) {
+          this.qrWasShown = false;
+          this.setStatus({ state: 'DISCONNECTED', qrDataUrl: null, error: 'The QR expired before it was scanned. A fresh one is being generated.' });
+          this.logger.info('WhatsApp QR was not scanned before its refs expired; regenerating a fresh QR shortly');
+          this.reconnectTimer = setTimeout(() => void this.start(), 3_000);
           return;
         }
         this.scheduleReconnect();
@@ -338,18 +368,25 @@ export class WhatsAppManager {
     this.setStatus({ state: 'DISCONNECTED', qrDataUrl: null });
   }
 
-  public async relink(clearRejectedSession = false): Promise<void> {
+  public async relink(clearRejectedSession = false, skipRestore = false): Promise<void> {
     await this.disconnect();
     // Do not delete credentials during an ordinary reconnect. A deliberate
     // fresh QR flow is the exception: WhatsApp has already rejected the
     // session, so the live and per-account backup copies are removed to
     // prevent restoring the same rejected credentials, and the next connect
     // skips backup restoration entirely. The legacy backup folder is left
-    // untouched as a last-resort recovery record.
-    if (clearRejectedSession) {
+    // untouched as a last-resort recovery record. A QR regeneration without
+    // a rejection (skipRestore) also skips restoration and removes only the
+    // live folder when it still holds a linked session: backups survive, but
+    // the old identity cannot be handed to the socket that must show a QR.
+    if (clearRejectedSession || skipRestore) {
       this.skipRestoreNextConnect = true;
+    }
+    if (clearRejectedSession) {
       await rm(this.authDir, { recursive: true, force: true });
       await rm(this.authBackupDir, { recursive: true, force: true });
+    } else if (skipRestore && this.hasSavedSession()) {
+      await rm(this.authDir, { recursive: true, force: true });
     }
     await this.start();
   }

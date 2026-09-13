@@ -2,7 +2,11 @@ import { useCallback, useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
 
-const api = 'http://127.0.0.1:3001';
+// The built dashboard is served same-origin by the local API (default port
+// 3001), so API calls go back to the page's own origin there. In development
+// the Vite server (fixed port 5173) serves the dashboard and does not proxy
+// the API, so that case must keep calling the API on its own port directly.
+const api = window.location.port === '5173' ? 'http://127.0.0.1:3001' : (window.location.origin || 'http://127.0.0.1:3001');
 type Status = { state: string; phone: string | null; lastConnectedAt: string | null; qrDataUrl: string | null; error: string | null; warning: string | null };
 type Account = { id: string; name: string; phone: string | null; status: Status };
 type Group = { whatsappGroupJid: string; name: string; isScannerEnabled: boolean; isExcluded: boolean };
