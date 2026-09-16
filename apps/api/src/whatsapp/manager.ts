@@ -1,5 +1,5 @@
 import makeWASocket, { Browsers, DisconnectReason, fetchLatestWaWebVersion, useMultiFileAuthState } from '@whiskeysockets/baileys';
-import type { ConnectionState, WASocket } from '@whiskeysockets/baileys';
+import type { ConnectionState, GroupMetadata, WASocket } from '@whiskeysockets/baileys';
 import type { FastifyBaseLogger } from 'fastify';
 import QRCode from 'qrcode';
 import { existsSync, readFileSync } from 'node:fs';
@@ -201,6 +201,21 @@ export class WhatsAppManager {
           });
         }
       });
+      // Keep the local group list current while connected: joining a group,
+      // being added to one, or a rename arrives as a group event, so the
+      // dashboard sees new groups immediately instead of only after a manual
+      // refresh or a reconnect.
+      socket.ev.on('groups.upsert', (updates: GroupMetadata[]) => {
+        void this.upsertGroups(updates).catch((error: unknown) => {
+          this.logger.error({ err: error }, 'Unable to record WhatsApp group changes');
+        });
+      });
+      socket.ev.on('groups.update', (updates: Partial<GroupMetadata>[]) => {
+        const known = updates.filter((update): update is Partial<GroupMetadata> & { id: string } => typeof update.id === 'string');
+        void this.upsertGroups(known).catch((error: unknown) => {
+          this.logger.error({ err: error }, 'Unable to record WhatsApp group changes');
+        });
+      });
       socket.ev.on('connection.update', (update) => {
         // One async handler that never rejects: a throwing handler here would
         // be an unhandled rejection that kills the whole API process.
@@ -311,15 +326,31 @@ export class WhatsAppManager {
   public async syncGroups(): Promise<number> {
     if (!this.socket || this.status.state !== 'CONNECTED') throw new Error('WhatsApp is not connected.');
     const available = await this.socket.groupFetchAllParticipating();
-    const syncedAt = now();
-    for (const [jid, metadata] of Object.entries(available)) {
-      await db.insert(groups).values({
-        id: randomUUID(), accountId: this.accountId, whatsappGroupJid: jid, name: metadata.subject || jid, description: metadata.desc ?? null,
-        isTarget: false, isScannerEnabled: true, isExcluded: false, lastSyncedAt: syncedAt, createdAt: syncedAt, updatedAt: syncedAt,
-      }).onConflictDoUpdate({ target: [groups.accountId, groups.whatsappGroupJid], set: { name: metadata.subject || jid, description: metadata.desc ?? null, lastSyncedAt: syncedAt, updatedAt: syncedAt } });
-    }
+    await this.upsertGroups(Object.values(available));
     this.logger.info({ groups: Object.keys(available).length }, 'WhatsApp group sync completed');
     return Object.keys(available).length;
+  }
+
+  /**
+   * Insert or refresh local group rows from live WhatsApp group metadata.
+   * Name and description are only overwritten when WhatsApp provides them, so
+   * a partial event (for example groups.update) can never blank a known name.
+   */
+  private async upsertGroups(metadata: Array<{ id: string; subject?: string; desc?: string }>): Promise<void> {
+    const syncedAt = now();
+    for (const group of metadata) {
+      await db.insert(groups).values({
+        id: randomUUID(), accountId: this.accountId, whatsappGroupJid: group.id, name: group.subject || group.id, description: group.desc ?? null,
+        isTarget: false, isScannerEnabled: true, isExcluded: false, lastSyncedAt: syncedAt, createdAt: syncedAt, updatedAt: syncedAt,
+      }).onConflictDoUpdate({
+        target: [groups.accountId, groups.whatsappGroupJid],
+        set: {
+          ...(group.subject !== undefined ? { name: group.subject } : {}),
+          ...(group.desc !== undefined ? { description: group.desc } : {}),
+          lastSyncedAt: syncedAt, updatedAt: syncedAt,
+        },
+      });
+    }
   }
 
   public async joinGroup(inviteCode: string): Promise<string> {
@@ -333,7 +364,16 @@ export class WhatsAppManager {
       if (required > 0) await wait(required * 1_000);
       const groupJid = await this.socket.groupAcceptInvite(inviteCode);
       if (!groupJid) throw new Error('WhatsApp did not confirm that the group was joined.');
-      await this.syncGroups();
+      try {
+        await this.syncGroups();
+      } catch (error) {
+        // The join itself succeeded: a follow-up sync failure (for example a
+        // momentary socket drop) must not report the join as failed. Record
+        // the group row so the list stays current; the next sync fills in its
+        // name when the connection settles.
+        this.logger.warn({ err: error, groupJid }, 'Group joined, but the follow-up group sync failed; recording the group without its name');
+        await this.upsertGroups([{ id: groupJid }]);
+      }
       await db.update(groups).set({ joinedAt: new Date().toISOString() }).where(and(eq(groups.accountId, this.accountId), eq(groups.whatsappGroupJid, groupJid)));
       const [group] = await db.select({ name: groups.name }).from(groups).where(and(eq(groups.accountId, this.accountId), eq(groups.whatsappGroupJid, groupJid))).limit(1);
       if (group) {

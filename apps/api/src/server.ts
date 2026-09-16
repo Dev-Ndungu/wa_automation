@@ -50,7 +50,14 @@ await app.register(cookie);
 // The dashboard is normally served same-origin by this API, but allow the
 // configured dev origin and the two common local hostnames so an accidental
 // 127.0.0.1 vs localhost mismatch never silently blocks every request.
-await app.register(cors, { origin: [config.WEB_ORIGIN, 'http://127.0.0.1:3001', 'http://localhost:3001', 'http://127.0.0.1:5173', 'http://localhost:5173'], credentials: true });
+await app.register(cors, {
+  origin: [config.WEB_ORIGIN, 'http://127.0.0.1:3001', 'http://localhost:3001', 'http://127.0.0.1:5173', 'http://localhost:5173'],
+  credentials: true,
+  // The dashboard manages campaigns with DELETE, PUT and PATCH requests, and
+  // the Vite development dashboard crosses ports, so every browser method the
+  // dashboard uses must pass the CORS preflight.
+  methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+});
 await app.register(rateLimit, { global: false });
 await app.register(systemRoutes);
 const accounts = new AccountService(app.log);
