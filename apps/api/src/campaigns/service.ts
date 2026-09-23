@@ -6,7 +6,7 @@ import sharp from 'sharp';
 import { db } from '../db/client.js';
 import { campaignSources, campaignTargets, campaigns, groups, operationalLogs, sourceMessages } from '../db/schema.js';
 import type { WhatsAppManager, WhatsAppStatus } from '../whatsapp/manager.js';
-import { CIRCUIT_BREAKER_CONSECUTIVE_FAILURES, drawCampaignWarmupSeconds, drawGroupCooldownMs, drawGroupGraceMs, drawReconnectSettleSeconds, drawSendGapSeconds, GROUP_COOLDOWN, recordSend, SEND_DAILY_LIMIT, SEND_GAP, sendsToday } from '../safety/limits.js';
+import { CIRCUIT_BREAKER_CONSECUTIVE_FAILURES, drawCampaignWarmupSeconds, drawGroupCooldownMs, drawGroupGraceMs, drawReconnectSettleSeconds, drawSendGapSeconds, GROUP_COOLDOWN, millisecondsUntilDailyBudgetResets, millisecondsUntilSendWindowOpens, recordSend, SEND_DAILY_LIMIT, SEND_GAP, sendsToday } from '../safety/limits.js';
 import { canDeliverTarget, cooldownWarnings, type CampaignSchedule, validateExplicitTargets, validateSchedule } from './policy.js';
 
 const now = () => new Date().toISOString();
@@ -30,6 +30,18 @@ export type CampaignPacing = {
    * transition and applied to the first send through the serial queue.
    */
   reconnectSettleMs: () => number;
+  /**
+   * How long a campaign auto-paused on the daily send budget waits before it
+   * resumes itself: in production the time until the budget refills (the next
+   * UTC midnight) and the send window is open again, whichever is later.
+   */
+  dailyBudgetResetMs: () => number;
+  /**
+   * Milliseconds until the nightly quiet hours end, or 0 while the send window
+   * is open. Production reads the real clock (06:00-23:00 EAT); tests inject 0
+   * so a suite is not blocked by the hour it happens to run at.
+   */
+  sendWindowDelayMs: () => number;
 };
 
 export const DEFAULT_PACING: CampaignPacing = {
@@ -37,6 +49,12 @@ export const DEFAULT_PACING: CampaignPacing = {
   sendGapSeconds: drawSendGapSeconds,
   warmupSeconds: drawCampaignWarmupSeconds,
   reconnectSettleMs: () => drawReconnectSettleSeconds() * 1_000,
+  // The budget refills at UTC midnight (03:00 EAT), inside the nightly quiet
+  // hours, so the resume waits for the send window to open as well: a resumed
+  // campaign starts delivering straight away instead of holding a claimed row
+  // until 06:00 EAT.
+  dailyBudgetResetMs: () => Math.max(millisecondsUntilDailyBudgetResets(), millisecondsUntilSendWindowOpens()),
+  sendWindowDelayMs: () => millisecondsUntilSendWindowOpens(),
 };
 
 type CampaignStatus = 'DRAFT' | 'QUEUED' | 'RUNNING' | 'PAUSED' | 'COMPLETED' | 'STOPPED' | 'FAILED';
@@ -136,6 +154,11 @@ export class CampaignService {
   private workers = new Map<string, Promise<void>>();
   private workerWakeups = new Map<string, () => void>();
   private pendingWarmups = new Map<string, number>();
+  // Armed timers for campaigns auto-paused on the daily send budget: each one
+  // fires when the budget refills and resumes its campaign without an operator.
+  // The durable record is campaigns.auto_resume_at, so a restart re-arms them
+  // (see sweepAutoResumes) instead of losing the pending resume.
+  private autoResumeTimers = new Map<string, NodeJS.Timeout>();
   // One serial queue per account (a CampaignService exists per WhatsApp
   // account): every message send goes through it, so the minimum gap between
   // sends holds across concurrent campaigns, not just inside one campaign.
@@ -164,7 +187,10 @@ export class CampaignService {
         this.logger.info({ accountId, settleSeconds: Math.round(settleMs / 1_000) }, 'WhatsApp connected; sends are gated until the settle window passes');
       }
       this.lastConnectionState = status.state;
-      if (status.state === 'CONNECTED') void this.resumeRunningWorkers();
+      if (status.state === 'CONNECTED') {
+        void this.resumeRunningWorkers();
+        void this.sweepAutoResumes();
+      }
     });
     this.whatsapp.subscribeGroupJoined((group) => this.addJoinedGroupToCampaigns(group));
   }
@@ -445,7 +471,8 @@ export class CampaignService {
     const nextRunAt = schedule.type !== 'ONCE'
       ? (campaign.nextRunAt && Date.parse(campaign.nextRunAt) > Date.now() ? campaign.nextRunAt : nextScheduledRunAt(schedule))
       : null;
-    await db.update(campaigns).set({ status: 'RUNNING', startedAt: campaign.startedAt ?? startedAt, completedAt: null, nextRunAt, pauseReason: null }).where(eq(campaigns.id, id));
+    this.clearAutoResumeTimer(id);
+    await db.update(campaigns).set({ status: 'RUNNING', startedAt: campaign.startedAt ?? startedAt, completedAt: null, nextRunAt, pauseReason: null, autoResumeAt: null }).where(eq(campaigns.id, id));
     if (nextRunAt) await db.update(campaignTargets).set({ scheduledAt: nextRunAt }).where(eq(campaignTargets.campaignId, id));
     this.pendingWarmups.set(id, this.pacing.warmupSeconds());
     this.runWorker(id);
@@ -459,15 +486,16 @@ export class CampaignService {
     // Same operator-action semantics as start(): retrying is a fresh start.
     this.circuitOpen = false;
     this.consecutiveSendFailures = 0;
+    this.clearAutoResumeTimer(id);
     if (campaign.status === 'STOPPED' || campaign.status === 'COMPLETED') {
       await db.update(campaignTargets).set({ status: 'QUEUED', scheduledAt: null, sentAt: null, errorMessage: null, attemptCount: 0 })
         .where(eq(campaignTargets.campaignId, id));
     }
     if (campaign.status === 'DRAFT' || campaign.status === 'QUEUED' || campaign.status === 'PAUSED' || campaign.status === 'STOPPED' || campaign.status === 'COMPLETED') {
-      await db.update(campaigns).set({ status: 'RUNNING', startedAt: campaign.startedAt ?? now(), completedAt: null, nextRunAt: null, pauseReason: null })
+      await db.update(campaigns).set({ status: 'RUNNING', startedAt: campaign.startedAt ?? now(), completedAt: null, nextRunAt: null, pauseReason: null, autoResumeAt: null })
         .where(eq(campaigns.id, id));
     } else {
-      await db.update(campaigns).set({ nextRunAt: null, pauseReason: null }).where(eq(campaigns.id, id));
+      await db.update(campaigns).set({ nextRunAt: null, pauseReason: null, autoResumeAt: null }).where(eq(campaigns.id, id));
     }
     await db.update(campaignTargets).set({ scheduledAt: null }).where(eq(campaignTargets.campaignId, id));
     this.wakeWorker(id);
@@ -537,7 +565,10 @@ export class CampaignService {
 
   public async pause(id: string) {
     await this.requireStatus(id, ['RUNNING']);
-    await db.update(campaigns).set({ status: 'PAUSED' }).where(eq(campaigns.id, id));
+    // An operator pausing by hand stays paused: any pending budget auto-resume
+    // is dropped so the campaign cannot restart itself behind their back.
+    this.clearAutoResumeTimer(id);
+    await db.update(campaigns).set({ status: 'PAUSED', autoResumeAt: null }).where(eq(campaigns.id, id));
     // Wake a sleeping loop so pause takes effect immediately instead of after
     // its current wait chunk.
     this.wakeWorker(id);
@@ -549,7 +580,8 @@ export class CampaignService {
     // A paused campaign has no in-flight send: rows an older build left stuck
     // in SENDING are released back to the queue instead of blocking forever.
     await this.releaseStuckSendingRows(id);
-    await db.update(campaigns).set({ status: 'RUNNING', pauseReason: null }).where(eq(campaigns.id, id));
+    this.clearAutoResumeTimer(id);
+    await db.update(campaigns).set({ status: 'RUNNING', pauseReason: null, autoResumeAt: null }).where(eq(campaigns.id, id));
     this.runWorker(id);
     return this.get(id);
   }
@@ -563,7 +595,8 @@ export class CampaignService {
   public async stop(id: string) {
     await this.requireStatus(id, ['DRAFT', 'QUEUED', 'RUNNING', 'PAUSED']);
     const completedAt = now();
-    await db.update(campaigns).set({ status: 'STOPPED', completedAt, pauseReason: null }).where(eq(campaigns.id, id));
+    this.clearAutoResumeTimer(id);
+    await db.update(campaigns).set({ status: 'STOPPED', completedAt, pauseReason: null, autoResumeAt: null }).where(eq(campaigns.id, id));
     await db.update(campaignTargets).set({ status: 'CANCELLED' })
       .where(and(eq(campaignTargets.campaignId, id), inArray(campaignTargets.status, ['QUEUED', 'WAITING'])));
     // Mirror delete(): wake the sleeping loop so it exits instead of waiting
@@ -588,6 +621,7 @@ export class CampaignService {
         .where(and(eq(campaignTargets.campaignId, id), inArray(campaignTargets.status, ['QUEUED', 'WAITING'])));
       this.wakeWorker(id);
     }
+    this.clearAutoResumeTimer(id);
     // FK cascade (enabled by bootstrapDatabase) removes campaign_targets and
     // campaign_sources rows. source_messages are shared across campaigns and
     // are never deleted here.
@@ -603,6 +637,7 @@ export class CampaignService {
         .where(and(eq(campaignTargets.status, 'SENDING'), inArray(campaignTargets.campaignId, ownedCampaigns.map((campaign) => campaign.id))));
     }
     await this.resumeRunningWorkers();
+    await this.sweepAutoResumes();
   }
 
   private async addJoinedGroupToCampaigns(group: { jid: string; name: string }): Promise<void> {
@@ -804,7 +839,7 @@ export class CampaignService {
             // nothing from the parsed object, whose types do not narrow across
             // function boundaries.
             const caption = sourceContent.caption;
-            await this.enqueueAccountSend(async () => {
+            const sent = await this.enqueueAccountSend(async () => {
               await socket.sendMessage(target.groupJid, {
                 image: image.image,
                 caption,
@@ -813,7 +848,8 @@ export class CampaignService {
                 width: image.width,
                 height: image.height,
               });
-            }, this.pacing.minSendGapSeconds * 1_000);
+            }, this.pacing.minSendGapSeconds * 1_000, id);
+            if (!sent) { await this.releaseInterruptedTarget(id, target.id); return; }
           } else if (typeof sourceContent.videoDataUrl === 'string' && typeof sourceContent.caption === 'string') {
             const encoded = sourceContent.videoDataUrl.slice(sourceContent.videoDataUrl.indexOf(',') + 1);
             const video = Buffer.from(encoded, 'base64');
@@ -821,14 +857,16 @@ export class CampaignService {
             // No thumbnail is generated by our code (that would need ffmpeg in
             // our pipeline); Baileys computes one internally when jpegThumbnail
             // is omitted (see Utils/messages.js: requiresThumbnailComputation).
-            await this.enqueueAccountSend(async () => {
+            const sent = await this.enqueueAccountSend(async () => {
               await socket.sendMessage(target.groupJid, { video, caption, mimetype: 'video/mp4' });
-            }, this.pacing.minSendGapSeconds * 1_000);
+            }, this.pacing.minSendGapSeconds * 1_000, id);
+            if (!sent) { await this.releaseInterruptedTarget(id, target.id); return; }
           } else if (typeof sourceContent.text === 'string') {
             const text = sourceContent.text;
-            await this.enqueueAccountSend(async () => {
+            const sent = await this.enqueueAccountSend(async () => {
               await socket.sendMessage(target.groupJid, { text });
-            }, this.pacing.minSendGapSeconds * 1_000);
+            }, this.pacing.minSendGapSeconds * 1_000, id);
+            if (!sent) { await this.releaseInterruptedTarget(id, target.id); return; }
           } else throw new Error('The stored source message is invalid.');
           // A fresh random gap after every file delivered, so a group's files
           // are paced like consecutive sends across the whole account. The
@@ -870,29 +908,140 @@ export class CampaignService {
    * A send that throws rejects the returned promise (the caller marks the
    * target FAILED) without breaking the queue for later sends.
    */
-  private enqueueAccountSend(send: () => Promise<void>, minGapMs: number): Promise<void> {
+  private enqueueAccountSend(send: () => Promise<void>, minGapMs: number, campaignId: string): Promise<boolean> {
     const next = this.accountSendQueue.then(async () => {
-      const nowMs = Date.now();
-      const settleRemainingMs = this.settleUntilMs === null ? 0 : this.settleUntilMs - nowMs;
-      const remaining = Math.max(settleRemainingMs, minGapMs - (nowMs - this.lastSendAtMs));
-      if (remaining > 0) await wait(remaining);
-      await send();
-      this.lastSendAtMs = Date.now();
-      await recordSend(this.accountId);
+      while (true) {
+        const [campaign] = await db.select({ status: campaigns.status }).from(campaigns)
+          .where(and(eq(campaigns.id, campaignId), eq(campaigns.accountId, this.accountId))).limit(1);
+        if (!campaign || campaign.status !== 'RUNNING') return false;
+        const nowMs = Date.now();
+        const windowDelayMs = this.pacing.sendWindowDelayMs();
+        const settleRemainingMs = this.settleUntilMs === null ? 0 : this.settleUntilMs - nowMs;
+        const gapRemainingMs = minGapMs - (nowMs - this.lastSendAtMs);
+        const remaining = windowDelayMs > 0 ? windowDelayMs : Math.max(settleRemainingMs, gapRemainingMs);
+        if (remaining > 0) {
+          await wait(Math.min(remaining, 60_000));
+          continue;
+        }
+        // Recheck the time boundary immediately before sending in case a wait
+        // or database read crossed 23:00 EAT.
+        if (this.pacing.sendWindowDelayMs() > 0) continue;
+        await send();
+        this.lastSendAtMs = Date.now();
+        await recordSend(this.accountId);
+        return true;
+      }
     });
     this.accountSendQueue = next.then(() => undefined, () => undefined);
     return next;
+  }
+
+  private async releaseInterruptedTarget(campaignId: string, targetId: string): Promise<void> {
+    const [campaign] = await db.select({ status: campaigns.status }).from(campaigns)
+      .where(and(eq(campaigns.id, campaignId), eq(campaigns.accountId, this.accountId))).limit(1);
+    await db.update(campaignTargets).set({
+      status: campaign?.status === 'STOPPED' ? 'CANCELLED' : 'QUEUED',
+      errorMessage: campaign?.status === 'STOPPED' ? 'Campaign was stopped before this send.' : null,
+    }).where(eq(campaignTargets.id, targetId));
   }
 
   /**
    * Pause a campaign because the account-wide daily send budget is spent. The
    * pause is durable (status + pauseReason) so a restart cannot silently
    * resume it, and the worker is woken so the pause takes effect immediately.
+   *
+   * Unlike the circuit breaker, this pause is self-clearing: auto_resume_at
+   * records when the budget refills (the next UTC midnight) and a timer resumes
+   * the campaign then, so a new day needs no operator action. The column is the
+   * durable part — the timer is only this process's copy of it.
    */
   private async pauseForDailyBudget(id: string): Promise<void> {
-    await db.update(campaigns).set({ status: 'PAUSED', pauseReason: `Daily send limit reached (${SEND_DAILY_LIMIT} messages). Resume after UTC midnight for the budget to reset.` }).where(eq(campaigns.id, id));
-    await db.insert(operationalLogs).values({ id: randomUUID(), level: 'warn', event: 'campaign.auto_paused', details: JSON.stringify({ campaignId: id, reason: 'daily_budget' }), createdAt: now() });
+    const resumeAt = new Date(Date.now() + this.pacing.dailyBudgetResetMs()).toISOString();
+    await db.update(campaigns).set({
+      status: 'PAUSED',
+      pauseReason: `Daily send limit reached (${SEND_DAILY_LIMIT} messages). Sending resumes automatically when the budget resets at UTC midnight — no need to resume by hand.`,
+      autoResumeAt: resumeAt,
+    }).where(eq(campaigns.id, id));
+    await db.insert(operationalLogs).values({ id: randomUUID(), level: 'warn', event: 'campaign.auto_paused', details: JSON.stringify({ campaignId: id, reason: 'daily_budget', autoResumeAt: resumeAt }), createdAt: now() });
     this.wakeWorker(id);
+    this.armAutoResume(id, resumeAt);
+  }
+
+  /**
+   * Arm (or re-arm) this process's timer for a budget auto-resume. The wait is
+   * taken in chunks of at most 15 minutes so a suspended or clock-shifted
+   * machine re-evaluates the deadline against the database instead of trusting
+   * one long timer. Timers are unref'd: a pending resume never keeps the
+   * process alive by itself.
+   */
+  private armAutoResume(id: string, resumeAt: string): void {
+    this.clearAutoResumeTimer(id);
+    const remainingMs = Math.max(1, Date.parse(resumeAt) - Date.now());
+    const timer = setTimeout(() => {
+      this.autoResumeTimers.delete(id);
+      void this.applyAutoResume(id);
+    }, Math.min(remainingMs, 15 * 60_000));
+    timer.unref?.();
+    this.autoResumeTimers.set(id, timer);
+  }
+
+  private clearAutoResumeTimer(id: string): void {
+    const timer = this.autoResumeTimers.get(id);
+    if (timer) clearTimeout(timer);
+    this.autoResumeTimers.delete(id);
+  }
+
+  /**
+   * Resume a campaign whose budget auto-resume is due. Everything is re-checked
+   * against the database first, so a timer that fires early (a chunked wait), a
+   * campaign an operator has since stopped or resumed, or a budget that is
+   * somehow still spent all take the safe path: re-arm or do nothing. Never
+   * resumes a campaign that is not PAUSED with an auto_resume_at of its own,
+   * which is what keeps the circuit-breaker pause an operator-only recovery.
+   */
+  private async applyAutoResume(id: string): Promise<void> {
+    const [campaign] = await db.select({ status: campaigns.status, autoResumeAt: campaigns.autoResumeAt })
+      .from(campaigns).where(and(eq(campaigns.id, id), eq(campaigns.accountId, this.accountId))).limit(1);
+    if (!campaign || campaign.status !== 'PAUSED' || !campaign.autoResumeAt) {
+      this.clearAutoResumeTimer(id);
+      return;
+    }
+    if (Date.parse(campaign.autoResumeAt) > Date.now()) {
+      this.armAutoResume(id, campaign.autoResumeAt);
+      return;
+    }
+    if (await sendsToday(this.accountId) >= SEND_DAILY_LIMIT) {
+      // The budget is still spent (a clock change, or sends from elsewhere on
+      // the account): wait out the next window rather than resuming into an
+      // immediate re-pause.
+      const nextResumeAt = new Date(Date.now() + this.pacing.dailyBudgetResetMs()).toISOString();
+      await db.update(campaigns).set({ autoResumeAt: nextResumeAt }).where(eq(campaigns.id, id));
+      this.armAutoResume(id, nextResumeAt);
+      return;
+    }
+    await this.releaseStuckSendingRows(id);
+    await db.update(campaigns).set({ status: 'RUNNING', pauseReason: null, autoResumeAt: null })
+      .where(and(eq(campaigns.id, id), eq(campaigns.status, 'PAUSED')));
+    await db.insert(operationalLogs).values({ id: randomUUID(), level: 'info', event: 'campaign.auto_resumed', details: JSON.stringify({ campaignId: id, reason: 'daily_budget' }), createdAt: now() });
+    this.logger.info({ accountId: this.accountId, campaignId: id }, 'Daily send budget reset: resuming the campaign automatically');
+    // A fresh run pass gets its own warm-up, like an operator start would.
+    this.pendingWarmups.set(id, this.pacing.warmupSeconds());
+    this.runWorker(id);
+  }
+
+  /**
+   * Re-arm every pending budget auto-resume from the database: called after a
+   * restart (recover) and whenever the account reconnects, so a resume whose
+   * deadline passed while the process was down happens as soon as it is back.
+   */
+  private async sweepAutoResumes(): Promise<void> {
+    const pending = await db.select({ id: campaigns.id, autoResumeAt: campaigns.autoResumeAt }).from(campaigns)
+      .where(and(eq(campaigns.accountId, this.accountId), eq(campaigns.status, 'PAUSED'), sql`${campaigns.autoResumeAt} is not null`));
+    for (const campaign of pending) {
+      if (!campaign.autoResumeAt) continue;
+      if (Date.parse(campaign.autoResumeAt) <= Date.now()) await this.applyAutoResume(campaign.id);
+      else this.armAutoResume(campaign.id, campaign.autoResumeAt);
+    }
   }
 
   /**

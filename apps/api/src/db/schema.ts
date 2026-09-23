@@ -95,6 +95,9 @@ export const campaigns = sqliteTable('campaigns', {
   autoAddJoinedGroups: integer('auto_add_joined_groups', { mode: 'boolean' }).notNull().default(false),
   shuffleOrder: integer('shuffle_order', { mode: 'boolean' }).notNull().default(true),
   pauseReason: text('pause_reason'),
+  // When set, the campaign was auto-paused on the daily send budget and resumes
+  // itself at this time (the next UTC midnight, when the budget refills).
+  autoResumeAt: text('auto_resume_at'),
   createdAt: text('created_at').notNull(),
   startedAt: text('started_at'),
   completedAt: text('completed_at'),

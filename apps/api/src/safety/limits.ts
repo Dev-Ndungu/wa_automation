@@ -36,7 +36,39 @@ export const CAMPAIGN_WARMUP = { minSeconds: 30, maxSeconds: 120 };
  * conservative: sending to many groups every day is the classic restriction
  * trigger, and a fresh number has no reputation to spend.
  */
-export const SEND_DAILY_LIMIT = 30;
+export const SEND_DAILY_LIMIT = 50;
+
+/**
+ * Milliseconds until the daily send budget refills. The budget counts SEND rows
+ * from the start of the current UTC day (see sendsToday), so it resets at the
+ * next UTC midnight. Never returns 0, so a caller arming a timer on it cannot
+ * fire in the same instant the budget was spent.
+ */
+export function millisecondsUntilDailyBudgetResets(at = new Date()): number {
+  const nextMidnightMs = Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate() + 1);
+  return Math.max(1, nextMidnightMs - at.getTime());
+}
+
+/** Sends are only allowed during the configured East Africa daytime window. */
+export const SEND_WINDOW = { timezone: 'Africa/Nairobi', opensAtHour: 6, closesAtHour: 23 };
+
+/** Milliseconds until the next 06:00 EAT opening, or 0 while the window is open. */
+export function millisecondsUntilSendWindowOpens(at = new Date()): number {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: SEND_WINDOW.timezone,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(at);
+  const value = (type: string) => Number(parts.find((part) => part.type === type)?.value ?? 0);
+  const currentMs = ((value('hour') * 60 + value('minute')) * 60 + value('second')) * 1_000 + at.getMilliseconds();
+  const opensMs = SEND_WINDOW.opensAtHour * 60 * 60 * 1_000;
+  const closesMs = SEND_WINDOW.closesAtHour * 60 * 60 * 1_000;
+  if (currentMs >= opensMs && currentMs < closesMs) return 0;
+  const nextOpenMs = currentMs < opensMs ? opensMs : 24 * 60 * 60 * 1_000 + opensMs;
+  return nextOpenMs - currentMs;
+}
 
 /**
  * Reconnect ladder after a connection closes: each consecutive close draws a

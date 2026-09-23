@@ -21,8 +21,10 @@ following fixed, non-configurable precautions:
   a custom client identity.
 - Presence is never marked online, and full chat history is never synced.
 - Sends are paced with random gaps (60s–4min), random campaign warm-up, a quiet
-  window after every reconnect, and a hard cap of 30 messages per account per
-  day.
+  window after every reconnect, and a hard cap of 50 messages per account per
+  day. Reaching the cap pauses the campaign for the rest of the day; it resumes
+  itself once the cap resets at UTC midnight and the 06:00 EAT send window is
+  open again, so no operator action is needed for a new day.
 - Group joins are limited to 2 per 3 hours and 3 per day, and only ever happen
   when an administrator presses Join on a saved link. The scanner never joins
   groups automatically.

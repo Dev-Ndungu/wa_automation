@@ -57,11 +57,18 @@ const loggerStub = {
 // One service instance shared by all tests, bound to the 'main' account. The
 // pacing seam replaces the production random draws (60-240s gaps, 30-120s
 // warm-up) with instant values so the send loop is deterministic.
+// dailyBudgetResetMs stands in for "the time until the next UTC midnight" so the
+// budget auto-resume can be observed inside a test instead of waiting for a real
+// day boundary.
 const service = new CampaignService(whatsappStub, loggerStub, 'main', {
   minSendGapSeconds: 0,
   sendGapSeconds: () => 0,
   warmupSeconds: () => 0,
   reconnectSettleMs: () => 0,
+  dailyBudgetResetMs: () => 300,
+  // Sends are gated to 06:00-23:00 EAT in production; the suite must not depend
+  // on the hour it runs at, so the window is always open here.
+  sendWindowDelayMs: () => 0,
 });
 
 before(async () => {
@@ -375,9 +382,37 @@ test('daily send budget pauses the campaign before any message goes out', async 
   const [target] = await db.select({ status: campaignTargets.status }).from(campaignTargets).where(eq(campaignTargets.campaignId, campaign.id));
   assert.equal(target.status, 'QUEUED', 'a budget-paused target must return to QUEUED, never stay SENDING');
 
-  // Remove the budget rows so later tests see an empty action log
-  // (test-order independence).
+  // A budget pause is self-clearing: the campaign carries the auto-resume
+  // deadline so a new day needs no operator action.
+  const [paused] = await db.select({ autoResumeAt: campaigns.autoResumeAt }).from(campaigns).where(eq(campaigns.id, campaign.id));
+  assert.ok(paused.autoResumeAt, 'a budget-paused campaign must record when it resumes itself');
+
+  // Removing the SEND rows is what the next UTC day does to the budget: the
+  // armed resume (300ms here, UTC midnight in production) then puts the
+  // campaign back to RUNNING and the held message goes out without a resume
+  // call from anyone.
   await db.delete(actionLog).where(inArray(actionLog.id, budgetRowIds));
+  await waitForCampaignStatus(campaign.id, 'RUNNING');
+  const [resumed] = await db.select({ pauseReason: campaigns.pauseReason, autoResumeAt: campaigns.autoResumeAt })
+    .from(campaigns).where(eq(campaigns.id, campaign.id));
+  assert.equal(resumed.pauseReason, null, 'an auto-resumed campaign must not keep its pause reason');
+  assert.equal(resumed.autoResumeAt, null, 'an auto-resumed campaign must not keep its resume deadline');
+
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    const [target] = await db.select({ status: campaignTargets.status }).from(campaignTargets).where(eq(campaignTargets.campaignId, campaign.id));
+    if (target.status === 'SENT') break;
+    if (Date.now() >= deadline) assert.fail(`the auto-resumed campaign did not deliver; target status: ${target.status}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.equal(sentCalls.length, 1, 'exactly the held message goes out after the budget resets');
+
+  const resumeLogs = await db.select({ event: operationalLogs.event, details: operationalLogs.details }).from(operationalLogs)
+    .where(eq(operationalLogs.event, 'campaign.auto_resumed'));
+  assert.ok(resumeLogs.some((row) => row.details?.includes(campaign.id)), 'the automatic resume must be recorded in the operational log');
+
+  // Leave the action log empty for later tests (the delivery above added a row).
+  await db.delete(actionLog).where(eq(actionLog.accountId, 'main'));
 });
 
 test('shuffled multi-target send records every send in the action log', async () => {
@@ -426,6 +461,8 @@ test('concurrent campaigns keep every account send at least the minimum gap apar
     sendGapSeconds: () => 0,
     warmupSeconds: () => 0,
     reconnectSettleMs: () => 0,
+    dailyBudgetResetMs: () => 60_000,
+    sendWindowDelayMs: () => 0,
   });
   sentCalls.length = 0;
   sendTimes.length = 0;
@@ -513,6 +550,8 @@ test('settle window gates the first send after a reconnect and is re-drawn per r
     sendGapSeconds: () => 0,
     warmupSeconds: () => 0,
     reconnectSettleMs: () => 2000,
+    dailyBudgetResetMs: () => 60_000,
+    sendWindowDelayMs: () => 0,
   });
   sentCalls.length = 0;
   sendTimes.length = 0;
@@ -565,6 +604,8 @@ test('circuit breaker pauses every running campaign after consecutive send failu
     sendGapSeconds: () => 0,
     warmupSeconds: () => 0,
     reconnectSettleMs: () => 0,
+    dailyBudgetResetMs: () => 60_000,
+    sendWindowDelayMs: () => 0,
   });
   sentCalls.length = 0;
 

@@ -85,6 +85,9 @@ export async function bootstrapDatabase(): Promise<void> {
   if (!campaignColumns.some((column) => column.name === 'pause_reason')) {
     await db.run(sql`ALTER TABLE campaigns ADD COLUMN pause_reason text`);
   }
+  if (!campaignColumns.some((column) => column.name === 'auto_resume_at')) {
+    await db.run(sql`ALTER TABLE campaigns ADD COLUMN auto_resume_at text`);
+  }
   await db.run(sql`CREATE TABLE IF NOT EXISTS campaign_targets (id text PRIMARY KEY NOT NULL, campaign_id text NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE, group_jid text NOT NULL, group_name text NOT NULL, position integer NOT NULL, status text NOT NULL DEFAULT 'QUEUED', scheduled_at text, sent_at text, error_message text, attempt_count integer NOT NULL DEFAULT 0, UNIQUE(campaign_id, group_jid))`);
   await db.run(sql`CREATE TABLE IF NOT EXISTS campaign_sources (id text PRIMARY KEY NOT NULL, campaign_id text NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE, source_message_id text NOT NULL REFERENCES source_messages(id) ON DELETE CASCADE, position integer NOT NULL, created_at text NOT NULL, UNIQUE(campaign_id, source_message_id))`);
   await db.run(sql`CREATE TABLE IF NOT EXISTS operational_logs (id text PRIMARY KEY NOT NULL, level text NOT NULL, event text NOT NULL, details text, created_at text NOT NULL)`);
