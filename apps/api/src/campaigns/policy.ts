@@ -16,18 +16,6 @@ export function validateExplicitTargets(groupJids: unknown): string[] {
   return values;
 }
 
-export function validateIntervals(value: unknown): number[] {
-  const rawValues = Array.isArray(value) ? value : [value ?? 0];
-  if (rawValues.length === 0 || rawValues.length > 20) {
-    throw new Error('Select between 1 and 20 sending intervals.');
-  }
-  const intervals = rawValues.map((interval) => typeof interval === 'number' ? interval : Number(interval));
-  if (intervals.some((interval) => !Number.isInteger(interval) || interval < 0 || interval > 86_400)) {
-    throw new Error('Each interval must be a whole number of seconds from 0 to 86400.');
-  }
-  return intervals;
-}
-
 export function validateDailyRunTime(value: unknown): string | null {
   if (value === undefined || value === null || value === '') return null;
   if (typeof value !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(value)) {

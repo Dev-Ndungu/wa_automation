@@ -1,4 +1,4 @@
-import { integer, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
+import { index, integer, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
 
 const timestamps = {
   createdAt: text('created_at').notNull(),
@@ -44,6 +44,7 @@ export const groups = sqliteTable('groups', {
   isExcluded: integer('is_excluded', { mode: 'boolean' }).notNull().default(false),
   lastCampaignSentAt: text('last_campaign_sent_at'),
   lastSyncedAt: text('last_synced_at'),
+  joinedAt: text('joined_at'),
   ...timestamps,
 }, (table) => [uniqueIndex('groups_account_jid').on(table.accountId, table.whatsappGroupJid)]);
 
@@ -92,6 +93,8 @@ export const campaigns = sqliteTable('campaigns', {
   lastRunAt: text('last_run_at'),
   scheduleConfig: text('schedule_config').notNull().default('{"type":"ONCE"}'),
   autoAddJoinedGroups: integer('auto_add_joined_groups', { mode: 'boolean' }).notNull().default(false),
+  shuffleOrder: integer('shuffle_order', { mode: 'boolean' }).notNull().default(true),
+  pauseReason: text('pause_reason'),
   createdAt: text('created_at').notNull(),
   startedAt: text('started_at'),
   completedAt: text('completed_at'),
@@ -113,6 +116,16 @@ export const campaignTargets = sqliteTable('campaign_targets', {
   uniqueIndex('campaign_targets_sent_group').on(table.campaignId, table.groupJid, table.status),
 ]);
 
+export const campaignSources = sqliteTable('campaign_sources', {
+  id: text('id').primaryKey(),
+  campaignId: text('campaign_id').notNull().references(() => campaigns.id, { onDelete: 'cascade' }),
+  sourceMessageId: text('source_message_id').notNull().references(() => sourceMessages.id, { onDelete: 'cascade' }),
+  position: integer('position').notNull(),
+  createdAt: text('created_at').notNull(),
+}, (table) => [
+  uniqueIndex('campaign_sources_campaign_message').on(table.campaignId, table.sourceMessageId),
+]);
+
 export const operationalLogs = sqliteTable('operational_logs', {
   id: text('id').primaryKey(),
   level: text('level').notNull(),
@@ -120,3 +133,10 @@ export const operationalLogs = sqliteTable('operational_logs', {
   details: text('details'),
   createdAt: text('created_at').notNull(),
 });
+
+export const actionLog = sqliteTable('action_log', {
+  id: text('id').primaryKey(),
+  accountId: text('account_id').notNull().references(() => whatsappAccounts.id, { onDelete: 'cascade' }),
+  action: text('action').notNull(),
+  createdAt: text('created_at').notNull(),
+}, (table) => [index('action_log_account_action_created').on(table.accountId, table.action, table.createdAt)]);

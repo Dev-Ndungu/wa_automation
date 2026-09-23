@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { canDeliverTarget, cooldownWarnings, MAX_CAMPAIGN_TARGETS, validateDailyRunTime, validateExplicitTargets, validateIntervals, validateSchedule } from './policy.js';
+import { canDeliverTarget, cooldownWarnings, MAX_CAMPAIGN_TARGETS, validateDailyRunTime, validateExplicitTargets, validateSchedule } from './policy.js';
 
 test('explicit targets are capped, unique, and group-only', () => {
   assert.deepEqual(validateExplicitTargets(['one@g.us', 'two@g.us']), ['one@g.us', 'two@g.us']);
@@ -21,14 +21,6 @@ test('a recorded send cannot be delivered again', () => {
   assert.equal(canDeliverTarget('WAITING'), true);
   assert.equal(canDeliverTarget('SENT'), false);
   assert.equal(canDeliverTarget('SENDING'), false);
-});
-
-test('multiple sending intervals are valid, bounded, and retain their order', () => {
-  assert.deepEqual(validateIntervals([30, 60, 120]), [30, 60, 120]);
-  assert.deepEqual(validateIntervals(60), [60]);
-  assert.throws(() => validateIntervals([]));
-  assert.throws(() => validateIntervals([-1]));
-  assert.throws(() => validateIntervals([30.5]));
 });
 
 test('daily schedule time uses a valid 24-hour clock value', () => {

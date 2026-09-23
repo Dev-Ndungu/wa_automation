@@ -13,7 +13,14 @@ export function campaignRoutes(accounts: AccountService) {
     app.get('/api/campaigns', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.list());
     app.get('/api/campaigns/:id', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.get(idFrom(request)));
     app.post('/api/campaigns/source-messages/manual', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.captureManualSource(request.body as never));
-    app.post('/api/campaigns', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.create(request.body as never));
+    app.post('/api/campaigns', async (request, reply) => {
+      try {
+        return await (await accounts.get(accountIdFrom(request))).campaigns.create(request.body as never);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Could not create the campaign.';
+        return reply.code(400).send({ message });
+      }
+    });
     app.put('/api/campaigns/:id', async (request, reply) => {
       try {
         return await (await accounts.get(accountIdFrom(request))).campaigns.update(idFrom(request), request.body as never);
@@ -28,5 +35,6 @@ export function campaignRoutes(accounts: AccountService) {
     app.post('/api/campaigns/:id/resume', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.resume(idFrom(request)));
     app.post('/api/campaigns/:id/stop', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.stop(idFrom(request)));
     app.post('/api/campaigns/stop-all', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.stopAll());
+    app.delete('/api/campaigns/:id', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.delete(idFrom(request)));
   };
 }

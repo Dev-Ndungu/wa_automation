@@ -1,4 +1,4 @@
-import 'dotenv/config';
+import { config as loadEnvironment } from 'dotenv';
 import { fileURLToPath } from 'node:url';
 import { isAbsolute, resolve } from 'node:path';
 import { z } from 'zod';
@@ -6,6 +6,10 @@ import { z } from 'zod';
 // Keep the local database and WhatsApp credentials in one place regardless of
 // whether the API is started from the repository root or apps/api.
 const projectRoot = fileURLToPath(new URL('../../../', import.meta.url));
+// dotenv reads .env from the process working directory. npm workspace scripts
+// start this package with cwd=apps/api, where no .env exists, so load the
+// repository-root .env explicitly instead of relying on 'dotenv/config'.
+loadEnvironment({ path: resolve(projectRoot, '.env'), quiet: true });
 const fromProjectRoot = (path: string) => isAbsolute(path) ? path : resolve(projectRoot, path);
 
 const booleanFromEnvironment = z.enum(['true', 'false']).transform((value) => value === 'true');

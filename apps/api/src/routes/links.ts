@@ -23,13 +23,6 @@ function escapeCsv(value: unknown): string {
 export function linkRoutes(accounts: AccountService) {
   return async function routes(app: FastifyInstance): Promise<void> {
     app.get('/api/scanner/status', async (request) => ({ enabled: await (await accounts.get(accountIdFrom(request))).scanner.isEnabled() }));
-    app.get('/api/links/auto-join', async (request) => ({ enabled: await (await accounts.get(accountIdFrom(request))).scanner.isAutoJoinEnabled() }));
-    app.patch('/api/links/auto-join', async (request, reply) => {
-      const scanner = (await accounts.get(accountIdFrom(request))).scanner;
-      const parsed = scannerUpdate.safeParse(request.body);
-      if (!parsed.success) return reply.code(400).send({ message: 'enabled must be true or false.' });
-      return { enabled: await scanner.setAutoJoinEnabled(parsed.data.enabled) };
-    });
     app.patch('/api/scanner/status', async (request, reply) => {
       const scanner = (await accounts.get(accountIdFrom(request))).scanner;
       const parsed = scannerUpdate.safeParse(request.body);
@@ -59,7 +52,12 @@ export function linkRoutes(accounts: AccountService) {
       if (!id.success) return reply.code(400).send({ message: 'Invalid link ID.' });
       const link = await account.scanner.getLink(id.data);
       if (!link) return reply.code(404).send({ message: 'Link not found.' });
-      const groupJid = await account.whatsapp.joinGroup(link.inviteCode);
+      let groupJid: string;
+      try {
+        groupJid = await account.whatsapp.joinGroup(link.inviteCode);
+      } catch (error) {
+        return reply.code(400).send({ message: error instanceof Error ? error.message : 'Could not join this group.' });
+      }
       await account.scanner.deleteLink(link.id);
       return { groupJid, inviteUrl: link.inviteUrl };
     });

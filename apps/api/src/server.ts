@@ -17,9 +17,13 @@ import { linkRoutes } from './routes/links.js';
 import { whatsappRoutes } from './routes/whatsapp.js';
 
 const app = Fastify({
-  // A campaign image is submitted as a base64 data URL. Allow the documented
-  // roughly-4 MB image maximum plus base64 overhead and JSON framing.
-  bodyLimit: 12_000_000,
+  // Campaign media is submitted as base64 data URLs. A campaign save request
+  // carries up to 10 files: the documented roughly-4 MB image maximum plus
+  // base64 overhead and JSON framing, and the roughly-16 MB MP4 video maximum
+  // (a 16 MB raw video is a ~21.3 MB base64 data URL; with JSON framing
+  // ~22.4M chars). Ten such videos come to ~214 MB of base64, comfortably
+  // under the limit below.
+  bodyLimit: 256_000_000,
   logger: {
     level: config.LOG_LEVEL,
     redact: ['req.headers.cookie', 'req.headers.authorization', 'res.headers.set-cookie', 'password', 'passwordHash', 'csrfToken'],
@@ -43,7 +47,17 @@ const sendDashboardFile = async (relativePath: string) => {
 };
 
 await app.register(cookie);
-await app.register(cors, { origin: config.WEB_ORIGIN, credentials: true });
+// The dashboard is normally served same-origin by this API, but allow the
+// configured dev origin and the two common local hostnames so an accidental
+// 127.0.0.1 vs localhost mismatch never silently blocks every request.
+await app.register(cors, {
+  origin: [config.WEB_ORIGIN, 'http://127.0.0.1:3001', 'http://localhost:3001', 'http://127.0.0.1:5173', 'http://localhost:5173'],
+  credentials: true,
+  // The dashboard manages campaigns with DELETE, PUT and PATCH requests, and
+  // the Vite development dashboard crosses ports, so every browser method the
+  // dashboard uses must pass the CORS preflight.
+  methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+});
 await app.register(rateLimit, { global: false });
 await app.register(systemRoutes);
 const accounts = new AccountService(app.log);
