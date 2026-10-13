@@ -28,23 +28,48 @@ if [ -n "$portPid" ]; then
   sleep 1
 fi
 
-# Build the React dashboard without Vite's development server. This keeps the
-# dashboard and API in one dependable local process at http://127.0.0.1:3001.
-mkdir -p apps/web/dist/assets
-./node_modules/.bin/esbuild apps/web/src/main.tsx \
-  --bundle --format=esm --platform=browser --target=es2022 --jsx=automatic \
-  "--outfile=apps/web/dist/assets/index.js" --loader:.tsx=tsx --loader:.css=css
+# Build the dashboard and API only when their sources changed. Re-running
+# esbuild and tsc on every launch caused avoidable CPU and HDD activity.
+webIndex="apps/web/dist/index.html"
+webBundle="apps/web/dist/assets/index.js"
+webStyles="apps/web/dist/assets/index.css"
+apiBundle="apps/api/dist/server.js"
+buildWeb=0
+buildApi=0
 
-# The compiled server serves web/dist/index.html at "/". The original
-# PowerShell script never wrote this file (index.html still references the
-# Vite dev entry), so write the compiled entry point here. The stylesheet link
-# is required too: esbuild extracts imported CSS into a sibling index.css but
-# does not link it from the bundle, so nothing else would apply the styles.
-cat > apps/web/dist/index.html <<'EOF'
+if [[ ! -f "$webIndex" || ! -f "$webBundle" || ! -f "$webStyles" ]] \
+  || find apps/web/src -type f -newer "$webIndex" -print -quit | grep -q . \
+  || [[ package-lock.json -nt "$webIndex" || apps/web/package.json -nt "$webIndex" || apps/web/vite.config.ts -nt "$webIndex" ]]; then
+  buildWeb=1
+fi
+
+if [[ ! -f "$apiBundle" ]] \
+  || find apps/api/src -type f -newer "$apiBundle" -print -quit | grep -q . \
+  || [[ package-lock.json -nt "$apiBundle" || apps/api/package.json -nt "$apiBundle" || apps/api/tsconfig.json -nt "$apiBundle" ]]; then
+  buildApi=1
+fi
+
+if (( buildWeb )); then
+  echo 'Building dashboard (first launch or source changes)...'
+  mkdir -p apps/web/dist/assets
+  ./node_modules/.bin/esbuild apps/web/src/main.tsx \
+    --bundle --format=esm --platform=browser --target=es2022 --jsx=automatic \
+    "--outfile=apps/web/dist/assets/index.js" --loader:.tsx=tsx --loader:.css=css
+
+  # The compiled server serves this dashboard entry point and extracted CSS.
+  cat > "$webIndex" <<'EOF'
 <!doctype html><html lang="en"><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" /><title>WhatsApp Group Control</title><link rel="stylesheet" href="/assets/index.css" /></head><body><div id="root"></div><script type="module" src="/assets/index.js"></script></body></html>
 EOF
+fi
 
-./node_modules/.bin/tsc -p apps/api/tsconfig.json
+if (( buildApi )); then
+  echo 'Building API (first launch or source changes)...'
+  ./node_modules/.bin/tsc -p apps/api/tsconfig.json
+fi
+
+if (( ! buildWeb && ! buildApi )); then
+  echo 'Using existing build (no source changes).'
+fi
 
 echo 'Dashboard and API are starting at http://127.0.0.1:3001'
 exec node apps/api/dist/server.js

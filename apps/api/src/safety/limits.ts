@@ -36,7 +36,7 @@ export const CAMPAIGN_WARMUP = { minSeconds: 30, maxSeconds: 120 };
  * conservative: sending to many groups every day is the classic restriction
  * trigger, and a fresh number has no reputation to spend.
  */
-export const SEND_DAILY_LIMIT = 50;
+export const SEND_DAILY_LIMIT = 200;
 
 /**
  * Milliseconds until the daily send budget refills. The budget counts SEND rows

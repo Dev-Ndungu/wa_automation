@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
 
@@ -103,10 +103,15 @@ function App() {
   const [removedOriginalMedia, setRemovedOriginalMedia] = useState(false);
   const [autoAddJoinedGroups, setAutoAddJoinedGroups] = useState(false);
   const [shuffleOrder, setShuffleOrder] = useState(true);
+  const refreshInFlight = useRef(false);
 
   const request = useCallback((path: string, init?: RequestInit) => apiRequest(path, init, activeAccountId), [activeAccountId]);
 
   const refresh = useCallback(async () => {
+    // On a slow disk or connection a refresh can outlast the polling interval.
+    // Do not queue another set of API requests while the current one is active.
+    if (refreshInFlight.current) return;
+    refreshInFlight.current = true;
     try {
       const nextAccounts = await apiRequest('/api/accounts') as Account[];
       setAccounts(nextAccounts);
@@ -128,13 +133,22 @@ function App() {
       setError('');
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Local API unavailable.');
+    } finally {
+      refreshInFlight.current = false;
     }
   }, [activeAccountId, appliedLinkFilters]);
 
   useEffect(() => {
-    void refresh();
-    const timer = window.setInterval(() => void refresh(), 5_000);
-    return () => clearInterval(timer);
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') void refresh();
+    };
+    refreshWhenVisible();
+    const timer = window.setInterval(refreshWhenVisible, 15_000);
+    document.addEventListener('visibilitychange', refreshWhenVisible);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', refreshWhenVisible);
+    };
   }, [refresh]);
 
   async function act(path: string, body?: unknown) {
@@ -339,7 +353,7 @@ function App() {
   return <main><section className="card wide">
     <header><div><p className="eyebrow">LOCAL DASHBOARD</p><h1>WhatsApp Group Control</h1></div><div className="account-controls"><label>WhatsApp account<select value={activeAccountId ?? ''} onChange={(event) => selectAccount(event.target.value)}>{accounts.map((account) => <option key={account.id} value={account.id}>{account.name}{account.phone ? ` · ${account.phone}` : ''}</option>)}</select></label><input placeholder="New account name" value={newAccountName} onChange={(event) => setNewAccountName(event.target.value)} /><button className="secondary" onClick={() => void addAccount()}>Add account</button><span className={`badge ${connected ? 'ok' : ''}`}>{status?.state ?? 'LOADING'}</span></div></header>
     <nav>{(['home', 'groups', 'links', 'campaigns'] as const).map((item) => <button key={item} className={page === item ? '' : 'secondary'} onClick={() => setPage(item)}>{item[0].toUpperCase() + item.slice(1)}</button>)}</nav>
-    {page === 'campaigns' && <p className="hint">Campaign messages are sent only from 06:00 to 23:00 East Africa Time. Messages waiting at night continue after 06:00. The daily send cap (50 messages) pauses a campaign for the rest of the day and it resumes itself when the cap resets at UTC midnight — no manual resume needed.</p>}
+    {page === 'campaigns' && <p className="hint">Campaign messages are sent only from 06:00 to 23:00 East Africa Time. Messages waiting at night continue after 06:00. The daily send cap (200 messages) pauses a campaign for the rest of the day and it resumes itself when the cap resets at UTC midnight — no manual resume needed.</p>}
     {status?.warning && <p className="warning-banner" role="alert">{status.warning}</p>}
     {page === 'home' &&<section className="panel"><h2>WhatsApp connection</h2><p>{connected ? `Linked phone: ${status?.phone}${status?.lastConnectedAt ? ` · linked since ${new Date(status.lastConnectedAt).toLocaleString()}` : ''}` : status?.state === 'QR_READY' ? 'Scan this QR code in WhatsApp to link this device.' : status?.state === 'CONNECTING' ? 'Connecting to WhatsApp…' : 'Not linked'}</p>{!connected && status?.error && <p className="error">{status.error}</p>}{status?.qrDataUrl && <div className="qr-panel"><img src={status.qrDataUrl} alt="WhatsApp linking QR code" /><p>WhatsApp → Settings → Linked devices → Link a device</p></div>}{connected ? <><button onClick={() => void act('/api/whatsapp/sync-groups')}>Refresh groups</button><button className="secondary" onClick={() => void act('/api/whatsapp/disconnect')}>Disconnect</button></> : <button onClick={() => void act('/api/whatsapp/link')}>{status?.state === 'QR_READY' ? 'Generate a new QR code' : 'Link WhatsApp'}</button>}<p>Scanner is running locally. It only records group invite links; it never joins groups or sends anything automatically. Sends and joins are paced between safe random limits.</p></section>}
     {page === 'groups' && <section className="panel"><h2>Groups ({groups.length})</h2><p>Excluded groups are neither scanned nor available for campaigns. You can also retrieve each group’s current WhatsApp invite link here.</p><div className="list">{groups.map((group) => <div className="row" key={group.whatsappGroupJid}><div><strong>{group.name}</strong>{group.isExcluded && <span className="muted"> · Excluded</span>}{groupInviteLinks[group.whatsappGroupJid] && <><br /><a href={groupInviteLinks[group.whatsappGroupJid]} target="_blank" rel="noreferrer">Open WhatsApp group link</a></>}</div><div className="row-actions"><label><input type="checkbox" checked={group.isScannerEnabled} disabled={group.isExcluded} onChange={(event) => void updateGroup(group, { isScannerEnabled: event.target.checked })} /> Scan</label><label><input type="checkbox" checked={group.isExcluded} onChange={(event) => void updateGroup(group, { isExcluded: event.target.checked })} /> Exclude</label><button className="secondary" onClick={() => void showGroupInviteLink(group)}>Get WhatsApp link</button></div></div>)}</div></section>}
