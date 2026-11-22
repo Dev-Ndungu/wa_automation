@@ -126,6 +126,17 @@ function sourceKindFromPayload(payload: string): 'text' | 'image' | 'video' {
   return 'text';
 }
 
+/**
+ * Detect a source kind from a payload prefix. Summaries (the campaign list is
+ * polled every few seconds) must not load the full payload: media payloads
+ * carry megabytes of base64 after these keys.
+ */
+function sourceKindFromPrefix(prefix: string): 'text' | 'image' | 'video' {
+  if (/"kind"\s*:\s*"video"/.test(prefix) || /"videoDataUrl"\s*:/.test(prefix)) return 'video';
+  if (/"kind"\s*:\s*"image"/.test(prefix) || /"imageDataUrl"\s*:/.test(prefix)) return 'image';
+  return 'text';
+}
+
 function storedSchedule(value: string, legacyDailyRunTime: string | null): CampaignSchedule {
   try {
     const schedule = validateSchedule(JSON.parse(value));
@@ -417,41 +428,108 @@ export class CampaignService {
 
   public async list() {
     const rows = await db.select().from(campaigns).where(eq(campaigns.accountId, this.accountId)).orderBy(asc(campaigns.createdAt));
-    return Promise.all(rows.map((campaign) => this.get(campaign.id)));
+    if (rows.length === 0) return [];
+    const ids = rows.map((campaign) => campaign.id);
+    const targetRows = await db.select().from(campaignTargets)
+      .where(inArray(campaignTargets.campaignId, ids))
+      .orderBy(asc(campaignTargets.campaignId), asc(campaignTargets.position));
+    // One query for every source row instead of one campaign detail query per
+    // campaign, and only a payload prefix instead of the megabytes of base64
+    // stored after it.
+    const sourceRows = await db.select({
+      campaignId: campaignSources.campaignId,
+      sourceMessageId: campaignSources.sourceMessageId,
+      prefix: sql<string>`substr(${sourceMessages.payload}, 1, 160)`,
+      preview: sourceMessages.preview,
+    })
+      .from(campaignSources)
+      .innerJoin(sourceMessages, eq(campaignSources.sourceMessageId, sourceMessages.id))
+      .where(and(inArray(campaignSources.campaignId, ids), eq(sourceMessages.accountId, this.accountId)))
+      .orderBy(asc(campaignSources.campaignId), asc(campaignSources.position));
+    const legacyIds = [...new Set(rows
+      .filter((campaign) => !sourceRows.some((source) => source.campaignId === campaign.id))
+      .map((campaign) => campaign.sourceMessageReference))];
+    const legacyRows = legacyIds.length === 0 ? [] : await db.select({
+      id: sourceMessages.id,
+      prefix: sql<string>`substr(${sourceMessages.payload}, 1, 160)`,
+      preview: sourceMessages.preview,
+    }).from(sourceMessages)
+      .where(and(eq(sourceMessages.accountId, this.accountId), inArray(sourceMessages.id, legacyIds)));
+    const legacyById = new Map(legacyRows.map((row) => [row.id, row]));
+
+    const targetJids = [...new Set(targetRows.map((target) => target.groupJid))];
+    const recent = targetJids.length === 0 ? [] : await db.select({ jid: groups.whatsappGroupJid, lastCampaignSentAt: groups.lastCampaignSentAt })
+      .from(groups).where(and(eq(groups.accountId, this.accountId), inArray(groups.whatsappGroupJid, targetJids)));
+    const recentByJid = new Map(recent.map((group) => [group.jid, group]));
+
+    const targetsByCampaign = new Map<string, (typeof targetRows)[number][]>();
+    for (const target of targetRows) {
+      const list = targetsByCampaign.get(target.campaignId) ?? [];
+      list.push(target);
+      targetsByCampaign.set(target.campaignId, list);
+    }
+    const sourcesByCampaign = new Map<string, (typeof sourceRows)[number][]>();
+    for (const source of sourceRows) {
+      const list = sourcesByCampaign.get(source.campaignId) ?? [];
+      list.push(source);
+      sourcesByCampaign.set(source.campaignId, list);
+    }
+
+    return rows.map((campaign) => {
+      const targets = targetsByCampaign.get(campaign.id) ?? [];
+      let sources: CapturedSource[] = (sourcesByCampaign.get(campaign.id) ?? [])
+        .map((source) => ({ id: source.sourceMessageId, kind: sourceKindFromPrefix(source.prefix), preview: source.preview }));
+      if (sources.length === 0) {
+        const legacy = legacyById.get(campaign.sourceMessageReference);
+        if (legacy) sources = [{ id: legacy.id, kind: sourceKindFromPrefix(legacy.prefix), preview: legacy.preview }];
+      }
+      const warnings = cooldownWarnings(targets.flatMap((target) => {
+        const group = recentByJid.get(target.groupJid);
+        return group ? [group] : [];
+      }));
+      // Editing loads the detail endpoint, so the polled list can stay small.
+      return { ...campaign, targets, sources, sourceContent: null, warnings };
+    });
   }
 
   public async get(id: string) {
     const [campaign] = await db.select().from(campaigns).where(and(eq(campaigns.id, id), eq(campaigns.accountId, this.accountId))).limit(1);
     if (!campaign) throw new Error('Campaign not found.');
     const targets = await db.select().from(campaignTargets).where(eq(campaignTargets.campaignId, id)).orderBy(asc(campaignTargets.position));
-    const sourceRows = await db.select({ id: campaignSources.id, sourceMessageId: campaignSources.sourceMessageId, payload: sourceMessages.payload, preview: sourceMessages.preview })
+    // Read only a payload prefix plus the JSON text fields: selecting the full
+    // payload pulled megabytes of base64 into Node for every campaign load.
+    const sourceFields = {
+      id: sourceMessages.id,
+      prefix: sql<string>`substr(${sourceMessages.payload}, 1, 160)`,
+      text: sql<string | null>`case when json_valid(${sourceMessages.payload}) then json_extract(${sourceMessages.payload}, '$.text') end`,
+      caption: sql<string | null>`case when json_valid(${sourceMessages.payload}) then json_extract(${sourceMessages.payload}, '$.caption') end`,
+      preview: sourceMessages.preview,
+    };
+    const sourceRows = await db.select({ ...sourceFields, sourceMessageId: campaignSources.sourceMessageId })
       .from(campaignSources)
       .innerJoin(sourceMessages, eq(campaignSources.sourceMessageId, sourceMessages.id))
       .where(and(eq(campaignSources.campaignId, id), eq(sourceMessages.accountId, this.accountId)))
       .orderBy(asc(campaignSources.position));
     // Legacy campaigns (created before campaign_sources existed) have no rows;
     // fall back to the single source_message_reference entry.
-    let firstPayload: string | null = null;
+    let first: { prefix: string; text: string | null; caption: string | null } | null = null;
     let sources: CapturedSource[] = [];
     if (sourceRows.length) {
-      sources = sourceRows.map((row) => ({ id: row.sourceMessageId, kind: sourceKindFromPayload(row.payload), preview: row.preview }));
-      firstPayload = sourceRows[0].payload;
+      sources = sourceRows.map((row) => ({ id: row.sourceMessageId, kind: sourceKindFromPrefix(row.prefix), preview: row.preview }));
+      first = sourceRows[0];
     } else {
-      const [source] = await db.select({ payload: sourceMessages.payload, preview: sourceMessages.preview }).from(sourceMessages)
+      const [source] = await db.select(sourceFields).from(sourceMessages)
         .where(and(eq(sourceMessages.id, campaign.sourceMessageReference), eq(sourceMessages.accountId, this.accountId))).limit(1);
       if (source) {
-        firstPayload = source.payload;
-        sources = [{ id: campaign.sourceMessageReference, kind: sourceKindFromPayload(source.payload), preview: source.preview }];
+        first = source;
+        sources = [{ id: campaign.sourceMessageReference, kind: sourceKindFromPrefix(source.prefix), preview: source.preview }];
       }
     }
-    let sourceContent: { text: string; hasImage: boolean } | null = null;
-    try {
-      const parsed = firstPayload ? JSON.parse(firstPayload) as { text?: unknown; caption?: unknown; imageDataUrl?: unknown } : null;
-      const text = typeof parsed?.text === 'string' ? parsed.text : typeof parsed?.caption === 'string' ? parsed.caption : '';
-      // Legacy semantics: a legacy image payload has imageDataUrl, so the first
-      // source being an image (hasImage true) is preserved for edit prefill.
-      sourceContent = { text, hasImage: typeof parsed?.imageDataUrl === 'string' };
-    } catch { /* A broken legacy source remains visible as a campaign but cannot be prefilled. */ }
+    // Legacy semantics: hasImage follows whether the first source is an image.
+    const text = typeof first?.text === 'string' ? first.text : typeof first?.caption === 'string' ? first.caption : '';
+    const sourceContent: { text: string; hasImage: boolean } | null = first
+      ? { text, hasImage: sourceKindFromPrefix(first.prefix) === 'image' }
+      : null;
     const recent = await db.select({ jid: groups.whatsappGroupJid, lastCampaignSentAt: groups.lastCampaignSentAt }).from(groups)
       .where(and(eq(groups.accountId, this.accountId), inArray(groups.whatsappGroupJid, targets.map((target) => target.groupJid))));
     return { ...campaign, targets, sources, sourceContent, warnings: cooldownWarnings(recent) };

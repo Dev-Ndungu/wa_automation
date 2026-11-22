@@ -103,14 +103,17 @@ function App() {
   const [removedOriginalMedia, setRemovedOriginalMedia] = useState(false);
   const [autoAddJoinedGroups, setAutoAddJoinedGroups] = useState(false);
   const [shuffleOrder, setShuffleOrder] = useState(true);
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
   const refreshInFlight = useRef(false);
+  const refreshQueued = useRef(false);
 
   const request = useCallback((path: string, init?: RequestInit) => apiRequest(path, init, activeAccountId), [activeAccountId]);
 
   const refresh = useCallback(async () => {
     // On a slow disk or connection a refresh can outlast the polling interval.
-    // Do not queue another set of API requests while the current one is active.
-    if (refreshInFlight.current) return;
+    // Do not queue another set of API requests while the current one is active,
+    // but remember that a newer refresh was requested and run it afterwards.
+    if (refreshInFlight.current) { refreshQueued.current = true; return; }
     refreshInFlight.current = true;
     try {
       const nextAccounts = await apiRequest('/api/accounts') as Account[];
@@ -135,6 +138,10 @@ function App() {
       setError(cause instanceof Error ? cause.message : 'Local API unavailable.');
     } finally {
       refreshInFlight.current = false;
+      if (refreshQueued.current) {
+        refreshQueued.current = false;
+        setTimeout(() => void refresh(), 0);
+      }
     }
   }, [activeAccountId, appliedLinkFilters]);
 
@@ -152,14 +159,19 @@ function App() {
   }, [refresh]);
 
   async function act(path: string, body?: unknown) {
+    setPendingAction(path);
     try {
       const result = await request(path, { method: 'POST', headers: body ? { 'Content-Type': 'application/json' } : undefined, body: body ? JSON.stringify(body) : undefined });
       setMessage('Saved.');
-      await refresh();
+      // Refresh in the background: the action has already been saved, and
+      // waiting for the whole dashboard snapshot made every click feel slow.
+      void refresh();
       return result;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Action failed.');
       return null;
+    } finally {
+      setPendingAction(null);
     }
   }
 
@@ -280,29 +292,35 @@ function App() {
   }
 
   async function beginCampaignEdit(campaign: Campaign) {
+    // Opening the form must be instant. The campaign list is a lightweight
+    // summary, so load the detail for the source text, and use the groups that
+    // the dashboard already polls instead of waiting for a live WhatsApp sync.
+    let detail = campaign;
     let latestGroups = groups;
-    if (connected) {
-      try {
-        await request('/api/whatsapp/sync-groups', { method: 'POST' });
+    setPendingAction(`edit:${campaign.id}`);
+    try {
+      if (latestGroups.length === 0) {
         latestGroups = await request('/api/groups') as Group[];
         setGroups(latestGroups);
-      } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not refresh groups before editing.'); return; }
-    }
+      }
+      detail = await request(`/api/campaigns/${campaign.id}`) as Campaign;
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not load the campaign for editing.'); return; }
+    finally { setPendingAction(null); }
     let schedule: Record<string, unknown> = { type: 'ONCE' };
-    try { schedule = JSON.parse(campaign.scheduleConfig ?? '{"type":"ONCE"}'); } catch { /* Keep the safe one-time default. */ }
-    setEditingCampaign(campaign); setCampaignName(campaign.name); setSource(campaign.sourceContent?.text ?? ''); setEditingSourceText(campaign.sourceContent?.text ?? '');
-    setOriginalMediaKinds(mediaKindsOf(campaign)); setRemovedOriginalMedia(false); setMediaFiles([]); setImageInputKey((key) => key + 1);
+    try { schedule = JSON.parse(detail.scheduleConfig ?? '{"type":"ONCE"}'); } catch { /* Keep the safe one-time default. */ }
+    setEditingCampaign(detail); setCampaignName(detail.name); setSource(detail.sourceContent?.text ?? ''); setEditingSourceText(detail.sourceContent?.text ?? '');
+    setOriginalMediaKinds(mediaKindsOf(detail)); setRemovedOriginalMedia(false); setMediaFiles([]); setImageInputKey((key) => key + 1);
     const eligibleGroupJids = new Set(latestGroups.filter((group) => !group.isExcluded).map((group) => group.whatsappGroupJid));
-    const editableTargets = campaign.targets.map((target) => target.groupJid).filter((jid) => eligibleGroupJids.has(jid));
-    const excludedTargetCount = campaign.targets.length - editableTargets.length;
-    setSelectedGroupJids(editableTargets); setOriginalCampaignGroupJids(campaign.targets.map((target) => target.groupJid)); setGroupListMode('all');
+    const editableTargets = detail.targets.map((target) => target.groupJid).filter((jid) => eligibleGroupJids.has(jid));
+    const excludedTargetCount = detail.targets.length - editableTargets.length;
+    setSelectedGroupJids(editableTargets); setOriginalCampaignGroupJids(detail.targets.map((target) => target.groupJid)); setGroupListMode('all');
     setScheduleType((schedule.type as typeof scheduleType) ?? 'ONCE');
     setIntervalMinutes(String(schedule.intervalMinutes ?? 15)); setIntervalHours(String(schedule.intervalHours ?? 1)); setIntervalDays(String(schedule.intervalDays ?? 3));
     setScheduleTime(typeof schedule.time === 'string' ? schedule.time : '17:00'); setWeekdays(Array.isArray(schedule.weekdays) ? schedule.weekdays as number[] : [1]);
-    setAutoAddJoinedGroups(Boolean(campaign.autoAddJoinedGroups)); setShuffleOrder(campaign.shuffleOrder ?? true);
+    setAutoAddJoinedGroups(Boolean(detail.autoAddJoinedGroups)); setShuffleOrder(detail.shuffleOrder ?? true);
     setMessage(excludedTargetCount > 0
-      ? `Editing “${campaign.name}”. ${excludedTargetCount} excluded group(s) were removed from this campaign.`
-      : campaign.status === 'RUNNING' ? `Editing “${campaign.name}” while it runs. Sent and in-progress groups will be kept.` : `Editing “${campaign.name}”. Save changes when ready.`);
+      ? `Editing “${detail.name}”. ${excludedTargetCount} excluded group(s) were removed from this campaign.`
+      : detail.status === 'RUNNING' ? `Editing “${detail.name}” while it runs. Sent and in-progress groups will be kept.` : `Editing “${detail.name}”. Save changes when ready.`);
   }
 
   async function saveCampaignEdit() {
@@ -346,6 +364,22 @@ function App() {
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not save campaign changes.'); }
   }
 
+  async function deleteCampaign(campaign: Campaign) {
+    if (!window.confirm(`Delete campaign "${campaign.name}"? This cannot be undone.`)) return;
+    const path = `/api/campaigns/${campaign.id}`;
+    setPendingAction(`delete:${campaign.id}`);
+    try {
+      await request(path, { method: 'DELETE' });
+      setMessage('Campaign deleted.');
+      if (editingCampaign?.id === campaign.id) clearCampaignForm();
+      void refresh();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Could not delete campaign.');
+    } finally {
+      setPendingAction(null);
+    }
+  }
+
   const connected = status?.state === 'CONNECTED';
   const campaignGroups = groups.filter((group) => !group.isExcluded);
   const newCampaignGroups = campaignGroups.filter((group) => !originalCampaignGroupJids.includes(group.whatsappGroupJid));
@@ -362,7 +396,7 @@ function App() {
       <h3>Recipient groups ({selectedGroupJids.length} / {campaignGroups.length})</h3><p className="hint">When editing, show only groups not already included in this campaign to add new groups quickly.</p><input placeholder="Search groups" value={groupSearch} onChange={(event) => setGroupSearch(event.target.value)} /><div className="selection-actions"><button className="secondary" onClick={() => void request('/api/whatsapp/sync-groups', { method: 'POST' }).then(refresh).catch((cause) => setError(cause instanceof Error ? cause.message : 'Could not refresh groups.'))}>Refresh available groups</button>{editingCampaign && <button className={groupListMode === 'new' ? '' : 'secondary'} onClick={() => setGroupListMode((mode) => mode === 'new' ? 'all' : 'new')}>{groupListMode === 'new' ? 'Show all groups' : `New groups (${newCampaignGroups.length})`}</button>}<button className="secondary" onClick={() => setSelectedGroupJids((current) => [...new Set([...current, ...shownGroups.map((group) => group.whatsappGroupJid)])])}>Select shown</button><button className="secondary" onClick={() => setSelectedGroupJids(campaignGroups.map((group) => group.whatsappGroupJid))}>Select all</button><button className="secondary" onClick={() => setSelectedGroupJids([])}>Clear selection</button></div><div className="list target-list">{shownGroups.map((group) => <label className="row selectable" key={group.whatsappGroupJid}><input type="checkbox" checked={selectedGroupJids.includes(group.whatsappGroupJid)} onChange={() => toggleCampaignGroup(group.whatsappGroupJid)} /><strong>{group.name}</strong></label>)}{groupListMode === 'new' && shownGroups.length === 0 && <p className="hint">No new groups are available for this campaign.</p>}</div>
       <h3>When should this campaign run?</h3><select value={scheduleType} onChange={(event) => setScheduleType(event.target.value as typeof scheduleType)}><option value="ONCE">Run once, when I press Start</option><option value="MINUTELY">Repeat every number of minutes</option><option value="HOURLY">Repeat every number of hours</option><option value="DAILY">Run every day at a time</option><option value="EVERY_N_DAYS">Run every number of days</option><option value="WEEKLY">Run weekly on selected days</option></select>{scheduleType === 'MINUTELY' && <label className="time-input">Repeat every (minutes)<input type="number" min="1" max="10080" step="1" value={intervalMinutes} onChange={(event) => setIntervalMinutes(event.target.value)} /></label>}{scheduleType === 'HOURLY' && <label className="time-input">Repeat every (hours)<input type="number" min="1" max="168" step="1" value={intervalHours} onChange={(event) => setIntervalHours(event.target.value)} /></label>}{['DAILY', 'EVERY_N_DAYS', 'WEEKLY'].includes(scheduleType) && <label className="time-input">Start time (24-hour clock)<input type="time" value={scheduleTime} onChange={(event) => setScheduleTime(event.target.value)} /></label>}{scheduleType === 'EVERY_N_DAYS' && <label className="time-input">Repeat every (days)<input type="number" min="2" max="365" step="1" value={intervalDays} onChange={(event) => setIntervalDays(event.target.value)} /></label>}{scheduleType === 'WEEKLY' && <div className="weekdays">{['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((name, day) => <label key={name}><input type="checkbox" checked={weekdays.includes(day)} onChange={() => toggleWeekday(day)} /> {name}</label>)}</div>}
       <label className="daily-toggle"><input type="checkbox" checked={autoAddJoinedGroups} onChange={(event) => setAutoAddJoinedGroups(event.target.checked)} /> Automatically add newly joined groups to this campaign</label><p className="hint">Groups joined through Links while this campaign is active will be added to its remaining recipients.</p><label className="daily-toggle"><input type="checkbox" checked={shuffleOrder} onChange={(event) => setShuffleOrder(event.target.checked)} /> Shuffle recipient order each run</label><p className="hint">Recipients are picked in a random order each run while files always keep their order.</p>{editingCampaign ? <button onClick={() => void saveCampaignEdit()}>{editingCampaign.status === 'RUNNING' ? 'Save live changes' : 'Save campaign changes'}</button> : <><button onClick={() => void createCampaign()}>Create campaign</button>{selectedGroupJids.length > 0 && <button onClick={() => void createCampaign(true)}>Create and start campaign</button>}</>}
-      <h2>Campaign history</h2><div className="list">{campaigns.map((campaign) => { const sent = campaign.targets.filter((target) => target.status === 'SENT').length; const sending = campaign.targets.filter((target) => target.status === 'SENDING').length; const failed = campaign.targets.filter((target) => target.status === 'FAILED').length; const waiting = campaign.targets.length - sent - failed - sending; return <div className="row campaign-row" key={campaign.id}><div><strong>{campaign.name}</strong><br /><span>{campaign.status} · {campaign.targets.length} groups</span><br /><span>{attachmentSummary(campaign)}</span><br /><span>{scheduleSummary(campaign)}</span>{campaign.autoAddJoinedGroups && <p className="hint">Newly joined groups are added automatically.</p>}{campaign.pauseReason && <p className="hint">{campaign.pauseReason}</p>}{campaign.autoResumeAt && <p className="hint">Resumes automatically at {new Date(campaign.autoResumeAt).toLocaleString()}.</p>}{campaign.status === 'RUNNING' && <p className="run-progress">Current run: <b>{sent} sent</b> · {sending} sending · {waiting} waiting · {failed} failed</p>}</div><div className="row-actions"><button className="secondary" onClick={() => void beginCampaignEdit(campaign)}>Edit</button>{campaign.status === 'RUNNING' && <button onClick={() => void act(`/api/campaigns/${campaign.id}/pause`)}>Pause</button>}<button onClick={() => void act(`/api/campaigns/${campaign.id}/run-now`)}>Run now</button><button className="secondary" onClick={() => void act(`/api/campaigns/${campaign.id}/stop`)}>Stop</button><button className="secondary" onClick={() => { if (window.confirm(`Delete campaign "${campaign.name}"? This cannot be undone.`)) { void request(`/api/campaigns/${campaign.id}`, { method: 'DELETE' }).then(() => { setMessage('Campaign deleted.'); if (editingCampaign?.id === campaign.id) clearCampaignForm(); void refresh(); }).catch((cause) => setError(cause instanceof Error ? cause.message : 'Could not delete campaign.')); } }}>Delete</button></div></div>; })}</div><button className="secondary" onClick={() => void act('/api/campaigns/stop-all')}>STOP ALL SENDING</button>
+      <h2>Campaign history</h2><div className="list">{campaigns.map((campaign) => { const sent = campaign.targets.filter((target) => target.status === 'SENT').length; const sending = campaign.targets.filter((target) => target.status === 'SENDING').length; const failed = campaign.targets.filter((target) => target.status === 'FAILED').length; const waiting = campaign.targets.length - sent - failed - sending; const pausePath = `/api/campaigns/${campaign.id}/pause`; const runNowPath = `/api/campaigns/${campaign.id}/run-now`; const stopPath = `/api/campaigns/${campaign.id}/stop`; const editKey = `edit:${campaign.id}`; const deleteKey = `delete:${campaign.id}`; return <div className="row campaign-row" key={campaign.id}><div><strong>{campaign.name}</strong><br /><span>{campaign.status} · {campaign.targets.length} groups</span><br /><span>{attachmentSummary(campaign)}</span><br /><span>{scheduleSummary(campaign)}</span>{campaign.autoAddJoinedGroups && <p className="hint">Newly joined groups are added automatically.</p>}{campaign.pauseReason && <p className="hint">{campaign.pauseReason}</p>}{campaign.autoResumeAt && <p className="hint">Resumes automatically at {new Date(campaign.autoResumeAt).toLocaleString()}.</p>}{campaign.status === 'RUNNING' && <p className="run-progress">Current run: <b>{sent} sent</b> · {sending} sending · {waiting} waiting · {failed} failed</p>}</div><div className="row-actions"><button className="secondary" disabled={pendingAction === editKey} onClick={() => void beginCampaignEdit(campaign)}>{pendingAction === editKey ? 'Loading…' : 'Edit'}</button>{campaign.status === 'RUNNING' && <button disabled={pendingAction === pausePath} onClick={() => void act(pausePath)}>{pendingAction === pausePath ? 'Pausing…' : 'Pause'}</button>}<button disabled={pendingAction === runNowPath} onClick={() => void act(runNowPath)}>{pendingAction === runNowPath ? 'Starting…' : 'Run now'}</button><button className="secondary" disabled={pendingAction === stopPath} onClick={() => void act(stopPath)}>{pendingAction === stopPath ? 'Stopping…' : 'Stop'}</button><button className="secondary" disabled={pendingAction === deleteKey} onClick={() => void deleteCampaign(campaign)}>{pendingAction === deleteKey ? 'Deleting…' : 'Delete'}</button></div></div>; })}</div><button className="secondary" onClick={() => void act('/api/campaigns/stop-all')}>STOP ALL SENDING</button>
     </section>}
     {message && <p className="success">{message}</p>}{error && <p className="error">{error}</p>}
   </section></main>;

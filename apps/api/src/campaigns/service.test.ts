@@ -213,6 +213,33 @@ test('multi-file capture sends image, video, image in order to every target', as
   }
 });
 
+test('campaign list stays lightweight while the detail keeps the editable source', async () => {
+  const captured = await service.captureManualSource({
+    text: 'List caption',
+    label: 'List summary',
+    files: [{ kind: 'image', dataUrl: TINY_PNG }],
+  });
+  const campaign = await service.create({
+    name: 'List summary campaign',
+    sourceMessageId: undefined,
+    sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['groupa@g.us'],
+    schedule: { type: 'ONCE' },
+  });
+
+  // The dashboard polls the list and refreshes it after every action: it must
+  // not include the stored caption, which sits after the media payload.
+  const summary = (await service.list()).find((entry) => entry.id === campaign.id);
+  assert.ok(summary);
+  assert.deepEqual(summary.sources.map((source) => source.kind), ['image']);
+  assert.equal(summary.sourceContent, null);
+
+  // Editing loads the detail endpoint, which still prefills the source.
+  const detail = await service.get(campaign.id);
+  assert.equal(detail.sourceContent?.text, 'List caption');
+  assert.equal(detail.sourceContent?.hasImage, true);
+});
+
 test('delete removes the campaign rows and keeps shared source messages', async () => {
   const captured = await service.captureManualSource({ text: 'Delete me', label: 'Delete test' });
   assert.equal(captured.sources.length, 1);
