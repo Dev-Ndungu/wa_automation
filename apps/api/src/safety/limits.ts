@@ -12,12 +12,20 @@ import { actionLog } from '../db/schema.js';
  * never to tune how fast things happen.
  */
 
-/** Random wait between consecutive group joins. */
-export const JOIN_PACING = { minSeconds: 120, maxSeconds: 300 };
+/**
+ * Random wait between consecutive group joins, drawn per join. Joining is the
+ * single most restriction-sensitive action, so the floor is deliberately long:
+ * a human would not join several groups minutes apart.
+ */
+export const JOIN_PACING = { minSeconds: 1_800, maxSeconds: 5_400 };
 
-/** Hard caps on joins: a burst window and a per-day total. */
-export const JOIN_BURST = { limit: 2, windowMinutes: 180 };
-export const JOIN_DAILY_LIMIT = 3;
+/**
+ * Hard caps on joins: a burst window and a per-day total. The burst window
+ * mirrors the pacing floor — no two joins may land within 30 minutes of each
+ * other — while the per-day total is the overall ceiling.
+ */
+export const JOIN_BURST = { limit: 2, windowMinutes: 30 };
+export const JOIN_DAILY_LIMIT = 15;
 
 /** Random wait between consecutive message sends, drawn per message. */
 export const SEND_GAP = { minSeconds: 60, maxSeconds: 240 };
@@ -32,11 +40,11 @@ export const NEW_GROUP_GRACE = { minMinutes: 120, maxMinutes: 360 };
 export const CAMPAIGN_WARMUP = { minSeconds: 30, maxSeconds: 120 };
 
 /**
- * Hard cap on campaign sends per account per UTC day. Kept deliberately
- * conservative: sending to many groups every day is the classic restriction
- * trigger, and a fresh number has no reputation to spend.
+ * Hard cap on campaign sends per account per UTC day. Raised to the observed
+ * safe ceiling for this account: sending to many groups every day is still the
+ * classic restriction trigger, so this is never tuned by hand at runtime.
  */
-export const SEND_DAILY_LIMIT = 200;
+export const SEND_DAILY_LIMIT = 300;
 
 /**
  * Milliseconds until the daily send budget refills. The budget counts SEND rows
@@ -69,6 +77,12 @@ export function millisecondsUntilSendWindowOpens(at = new Date()): number {
   const nextOpenMs = currentMs < opensMs ? opensMs : 24 * 60 * 60 * 1_000 + opensMs;
   return nextOpenMs - currentMs;
 }
+
+/** Joins share the same East Africa daytime window as sends. */
+export const JOIN_WINDOW = SEND_WINDOW;
+
+/** Milliseconds until the next daytime opening for joins, or 0 while open. */
+export const millisecondsUntilJoinWindowOpens = millisecondsUntilSendWindowOpens;
 
 /**
  * Reconnect ladder after a connection closes: each consecutive close draws a

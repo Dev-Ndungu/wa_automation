@@ -6,6 +6,7 @@ import { CampaignService } from '../campaigns/service.js';
 import { config } from '../config.js';
 import { db } from '../db/client.js';
 import { whatsappAccounts } from '../db/schema.js';
+import { JoinQueueService } from '../joins/service.js';
 import { ScannerService } from '../scanner/service.js';
 import { WhatsAppManager } from '../whatsapp/manager.js';
 
@@ -17,6 +18,7 @@ export type AccountRuntime = {
   scanner: ScannerService;
   whatsapp: WhatsAppManager;
   campaigns: CampaignService;
+  joins: JoinQueueService;
 };
 
 export class AccountService {
@@ -75,8 +77,12 @@ export class AccountService {
     const scanner = new ScannerService(this.logger, accountId);
     const whatsapp = new WhatsAppManager(this.logger, scanner, authDir, accountId);
     const campaigns = new CampaignService(whatsapp, this.logger, accountId);
-    const runtime = { id: accountId, scanner, whatsapp, campaigns };
+    const joins = new JoinQueueService(whatsapp, this.logger, accountId);
+    const runtime = { id: accountId, scanner, whatsapp, campaigns, joins };
     this.runtimes.set(accountId, runtime);
+    // The join processor self-gates on connection, the daytime window, and the
+    // pacing limits, so it is safe to arm immediately and leave running.
+    joins.start();
     return runtime;
   }
 }

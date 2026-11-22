@@ -93,6 +93,7 @@ export async function bootstrapDatabase(): Promise<void> {
   await db.run(sql`CREATE TABLE IF NOT EXISTS operational_logs (id text PRIMARY KEY NOT NULL, level text NOT NULL, event text NOT NULL, details text, created_at text NOT NULL)`);
   await db.run(sql`CREATE TABLE IF NOT EXISTS action_log (id text PRIMARY KEY NOT NULL, account_id text NOT NULL REFERENCES whatsapp_accounts(id) ON DELETE CASCADE, action text NOT NULL, created_at text NOT NULL)`);
   await db.run(sql`CREATE INDEX IF NOT EXISTS action_log_account_action_created ON action_log (account_id, action, created_at)`);
+  await db.run(sql`CREATE TABLE IF NOT EXISTS join_queue (id text PRIMARY KEY NOT NULL, account_id text NOT NULL REFERENCES whatsapp_accounts(id) ON DELETE CASCADE, invite_url text NOT NULL, invite_code text NOT NULL, status text NOT NULL DEFAULT 'QUEUED', group_jid text, error_message text, position integer NOT NULL DEFAULT 0, created_at text NOT NULL, joined_at text, failed_at text, UNIQUE(account_id, invite_url))`);
   // Anti-restriction pacing is now built-in and non-configurable (see
   // safety/limits.ts): drop any per-account settings rows users saved earlier
   // so a stale edit can never be read back into behavior.

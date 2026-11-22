@@ -143,3 +143,17 @@ export const actionLog = sqliteTable('action_log', {
   action: text('action').notNull(),
   createdAt: text('created_at').notNull(),
 }, (table) => [index('action_log_account_action_created').on(table.accountId, table.action, table.createdAt)]);
+
+export const joinQueue = sqliteTable('join_queue', {
+  id: text('id').primaryKey(),
+  accountId: text('account_id').notNull().references(() => whatsappAccounts.id, { onDelete: 'cascade' }),
+  inviteUrl: text('invite_url').notNull(),
+  inviteCode: text('invite_code').notNull(),
+  status: text('status', { enum: ['QUEUED', 'JOINED', 'FAILED', 'CANCELLED'] }).notNull().default('QUEUED'),
+  groupJid: text('group_jid'),
+  errorMessage: text('error_message'),
+  position: integer('position').notNull().default(0),
+  createdAt: text('created_at').notNull(),
+  joinedAt: text('joined_at'),
+  failedAt: text('failed_at'),
+}, (table) => [uniqueIndex('join_queue_account_url').on(table.accountId, table.inviteUrl)]);

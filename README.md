@@ -21,7 +21,7 @@ following fixed, non-configurable precautions:
   a custom client identity.
 - Presence is never marked online, and full chat history is never synced.
 - Sends are paced with random gaps (60s–4min), random campaign warm-up, a quiet
-  window after every reconnect, and a hard cap of 200 messages per account per
+  window after every reconnect, and a hard cap of 300 messages per account per
   day. Reaching the cap pauses the campaign for the rest of the day; it resumes
   itself once the cap resets at UTC midnight and the 06:00 EAT send window is
   open again, so no operator action is needed for a new day.

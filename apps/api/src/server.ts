@@ -12,6 +12,7 @@ import { bootstrapDatabase } from './db/bootstrap.js';
 import { campaignRoutes } from './routes/campaigns.js';
 import { accountRoutes } from './routes/accounts.js';
 import { groupRoutes } from './routes/groups.js';
+import { joinRoutes } from './routes/joins.js';
 import { systemRoutes } from './routes/system.js';
 import { linkRoutes } from './routes/links.js';
 import { whatsappRoutes } from './routes/whatsapp.js';
@@ -65,6 +66,7 @@ await app.register(accountRoutes(accounts));
 await app.register(groupRoutes(accounts));
 await app.register(whatsappRoutes(accounts));
 await app.register(linkRoutes(accounts));
+await app.register(joinRoutes(accounts));
 await app.register(campaignRoutes(accounts));
 
 app.get('/', async (_request, reply) => {
