@@ -37,6 +37,7 @@ const sentCalls: SentCall[] = [];
 // Delivery times kept in lockstep with sentCalls, for pacing assertions.
 const sendTimes: number[] = [];
 const statusCalls: Array<{ jid: string; content: unknown }> = [];
+let liveGroupJids: string[] = [];
 const noop = () => {};
 
 // Stub socket: every send is recorded in sentCalls, in delivery order.
@@ -50,6 +51,7 @@ const whatsappStub = {
   sendGroupStatus: async (jid: string, content: unknown) => {
     statusCalls.push({ jid, content });
   },
+  participatingGroupJids: async () => liveGroupJids,
   getStatus: () => ({ state: 'CONNECTED', phone: null, lastConnectedAt: null, qrDataUrl: null, error: null }),
   subscribe: () => noop,
   subscribeGroupJoined: () => noop,
@@ -74,6 +76,8 @@ const service = new CampaignService(whatsappStub, loggerStub, 'main', {
   // Sends are gated to 06:00-23:00 EAT in production; the suite must not depend
   // on the hour it runs at, so the window is always open here.
   sendWindowDelayMs: () => 0,
+  // Reconcile every worker pass so the targetAllGroups tests are deterministic.
+  statusReconcileIntervalMs: 0,
 });
 
 before(async () => {
@@ -893,4 +897,52 @@ test('starting a status campaign while disconnected is rejected', async () => {
     groupJids: ['offline-status@g.us'], deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
   } as never);
   await assert.rejects(() => offline.start(created.id), /must be connected/);
+});
+
+test('targetAllGroups adds a newly synced group', async () => {
+  await db.update(groups).set({ isExcluded: true });
+  await insertGroup('all-live@g.us', 'All live');
+  const captured = await service.captureManualSource({ text: 'All live status', label: 'All live status' });
+  const created = await service.create({
+    name: 'All live status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: [], deliveryMode: 'GROUP_STATUS', targetAllGroups: true, schedule: { type: 'ONCE' },
+  } as never);
+  await insertGroup('all-new@g.us', 'All new');
+  liveGroupJids = ['all-live@g.us', 'all-new@g.us'];
+  await service.start(created.id);
+  await waitForTargetsSent(created.id, 10_000, 2);
+  const jids = (await db.select({ jid: campaignTargets.groupJid }).from(campaignTargets)
+    .where(eq(campaignTargets.campaignId, created.id))).map((row) => row.jid).sort();
+  assert.deepEqual(jids, ['all-live@g.us', 'all-new@g.us']);
+});
+
+test('reconciliation cancels a queued target whose group is no longer live', async () => {
+  await insertGroup('left-group@g.us', 'Left group');
+  const captured = await service.captureManualSource({ text: 'Left status', label: 'Left status' });
+  const created = await service.create({
+    name: 'Left status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['left-group@g.us'], deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  } as never);
+  const reconcile = (service as unknown as {
+    reconcileAllGroupTargets: (id: string, live: string[]) => Promise<void>;
+  }).reconcileAllGroupTargets.bind(service);
+  await reconcile(created.id, ['some-other-group@g.us']);
+  const [target] = await db.select().from(campaignTargets).where(eq(campaignTargets.campaignId, created.id));
+  assert.equal(target.status, 'CANCELLED');
+  assert.match(target.errorMessage ?? '', /no longer a member/);
+});
+
+test('an empty live group list does not cancel targets', async () => {
+  await insertGroup('kept-group@g.us', 'Kept group');
+  const captured = await service.captureManualSource({ text: 'Kept status', label: 'Kept status' });
+  const created = await service.create({
+    name: 'Kept status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['kept-group@g.us'], deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  } as never);
+  const reconcile = (service as unknown as {
+    reconcileAllGroupTargets: (id: string, live: string[]) => Promise<void>;
+  }).reconcileAllGroupTargets.bind(service);
+  await reconcile(created.id, []);
+  const [target] = await db.select().from(campaignTargets).where(eq(campaignTargets.campaignId, created.id));
+  assert.equal(target.status, 'QUEUED');
 });

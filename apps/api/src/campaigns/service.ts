@@ -44,6 +44,11 @@ export type CampaignPacing = {
    * so a suite is not blocked by the hour it happens to run at.
    */
   sendWindowDelayMs: () => number;
+  /**
+   * How often a targetAllGroups status campaign reconciles its target list
+   * against live group membership. Tests inject 0 so every pass reconciles.
+   */
+  statusReconcileIntervalMs?: number;
 };
 
 export const DEFAULT_PACING: CampaignPacing = {
@@ -57,6 +62,7 @@ export const DEFAULT_PACING: CampaignPacing = {
   // until 06:00 EAT.
   dailyBudgetResetMs: () => Math.max(millisecondsUntilDailyBudgetResets(), millisecondsUntilSendWindowOpens()),
   sendWindowDelayMs: () => millisecondsUntilSendWindowOpens(),
+  statusReconcileIntervalMs: 10 * 60_000,
 };
 
 type CampaignStatus = 'DRAFT' | 'QUEUED' | 'RUNNING' | 'PAUSED' | 'COMPLETED' | 'STOPPED' | 'FAILED';
@@ -209,6 +215,8 @@ export class CampaignService {
   // sends holds across concurrent campaigns, not just inside one campaign.
   private accountSendQueue: Promise<void> = Promise.resolve();
   private lastSendAtMs = 0;
+  // Last successful targetAllGroups reconciliation per campaign, in ms.
+  private lastAllGroupReconcile = new Map<string, number>();
   // After the connection returns, sends stay gated until this wall-clock time.
   // Drawn once per reconnect (see the constructor subscription) so the account
   // sits quiet on the server side while the freshly resumed session settles.
@@ -846,6 +854,39 @@ export class CampaignService {
     }
   }
 
+  /**
+   * Add groups joined since the campaign was created and cancel groups the
+   * account left. An empty live list is a transient fetch failure, not an
+   * empty account, and must never cancel every target.
+   */
+  private async reconcileAllGroupTargets(campaignId: string, liveJids: string[]): Promise<void> {
+    if (liveJids.length === 0) return;
+    const existing = await db.select({ id: campaignTargets.id, groupJid: campaignTargets.groupJid, status: campaignTargets.status, position: campaignTargets.position })
+      .from(campaignTargets).where(eq(campaignTargets.campaignId, campaignId));
+    const known = new Set(existing.map((target) => target.groupJid));
+    const live = new Set(liveJids);
+    const missingJids = liveJids.filter((jid) => !known.has(jid));
+    if (missingJids.length > 0) {
+      const groupsToAdd = await db.select({ jid: groups.whatsappGroupJid, name: groups.name }).from(groups)
+        .where(and(eq(groups.accountId, this.accountId), eq(groups.isExcluded, false), inArray(groups.whatsappGroupJid, missingJids)));
+      let position = existing.reduce((max, target) => Math.max(max, target.position), -1) + 1;
+      for (const group of groupsToAdd) {
+        await db.insert(campaignTargets).values({
+          id: randomUUID(), campaignId, groupJid: group.jid, groupName: group.name, position,
+          status: 'QUEUED', scheduledAt: null, sentAt: null, errorMessage: null, attemptCount: 0,
+        }).onConflictDoNothing();
+        position += 1;
+      }
+    }
+    const staleIds = existing
+      .filter((target) => !live.has(target.groupJid) && (target.status === 'QUEUED' || target.status === 'WAITING'))
+      .map((target) => target.id);
+    if (staleIds.length > 0) {
+      await db.update(campaignTargets).set({ status: 'CANCELLED', errorMessage: 'The account is no longer a member of this group.' })
+        .where(inArray(campaignTargets.id, staleIds));
+    }
+  }
+
   /** One status payload: text, an image with caption, or a gated video. */
   private async statusContentFromPayload(payload: string): Promise<GroupStatusContent> {
     const content: unknown = JSON.parse(payload);
@@ -897,6 +938,17 @@ export class CampaignService {
       const [campaign] = await db.select().from(campaigns).where(and(eq(campaigns.id, id), eq(campaigns.accountId, this.accountId))).limit(1);
       if (!campaign || campaign.status !== 'RUNNING') return;
       const statusMode = campaign.deliveryMode === 'GROUP_STATUS';
+      if (statusMode && campaign.targetAllGroups) {
+        const lastReconcile = this.lastAllGroupReconcile.get(id) ?? 0;
+        if (Date.now() - lastReconcile >= (this.pacing.statusReconcileIntervalMs ?? 600_000)) {
+          try {
+            await this.reconcileAllGroupTargets(id, await this.whatsapp.participatingGroupJids());
+            this.lastAllGroupReconcile.set(id, Date.now());
+          } catch (error) {
+            this.logger.warn({ err: error, campaignId: id }, 'Unable to reconcile all-group status targets');
+          }
+        }
+      }
       // Pacing, budgets, grace and cooldown are frozen in safety/limits.ts and
       // drawn fresh from random ranges on every use — nothing here is loaded
       // from the database or configurable.
