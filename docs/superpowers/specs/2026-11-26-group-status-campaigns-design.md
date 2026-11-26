@@ -285,11 +285,16 @@ any fork is considered.
 
 Two rc14 details are part of the send path, not optional polish:
 
-- **Retry cache:** Baileys keeps a retry cache for resends. It must hold the
-  wrapped `groupStatusMessageV2` envelope, not the inner message; otherwise a
-  server-requested retry resends an unwrapped status and is silently dropped.
-  The builder must verify the retry path after wrapping (inspect the rc14 retry
-  code and cover it with a unit test that asserts the cached form).
+- **Retry cache:** rc14 caches the raw `relayMessage` argument (the inner
+  message). After each status relay we overwrite that cache entry with the
+  wrapped `groupStatusMessageV2` envelope, and `getMessage` also returns the
+  wrapper as a fallback, so a retry resends a status-shaped payload. Verified
+  in rc14 on 2026-11-26: the retry branch bypasses
+  `patchMessageBeforeSending` and does not attach `additionalNodes`, so the
+  plaintext `meta` node cannot be added on a retry through the public API. A
+  retried status may therefore still be dropped; the target is marked `SENT`
+  and the pilot must watch for it. Attaching the meta on retries would require
+  a local Baileys patch/fork.
 - **Incoming `<status>` stanzas:** rc14 registers no `CB:status` handler. When
   group members (including this account's own group-status audience) produce
   status traffic, the server expects an ack; without one it closes the stream
@@ -530,6 +535,14 @@ folder. Use a dedicated test group the operator creates and controls.
 
 The spike script is throwaway, not committed. Record the winning variant in
 the design/implementation notes.
+
+**Spike result (2026-11-26):** text (“spike: secret both”), image and video all
+rendered in Test213456 (a normal, non-Community group; see §7.10). The first
+`messageSecret: 'none'` text was sent only into the Community-linked UOEM group
+and did not render there; that group cannot render any group status, so `'none'`
+is not conclusively tested and `'both'` remains the default. The 1,024-character
+limit was not independently verified. The 60-minute connection check was still
+running when the implementation review completed.
 
 ### 9.3 Rollout
 

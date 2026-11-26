@@ -29,6 +29,41 @@ test('sendGroupStatus relays a marked inner message with the meta node', async (
   assert.deepEqual(relayed[0].options.additionalNodes, [GROUP_STATUS_META]);
 });
 
+test('sendGroupStatus caches the wrapped envelope for rc14 retries', async () => {
+  const manager = new WhatsAppManager(loggerStub, {} as never, '/tmp/wa-manager-status-test', 'main');
+  const relayed: Array<{ jid: string; message: proto.IMessage; options: Record<string, unknown> }> = [];
+  const retryCache: Array<{ to: string; id: string; message: proto.IMessage }> = [];
+  const fakeSocket = {
+    user: { id: '111:1@s.whatsapp.net' },
+    waUploadToServer: async () => ({}) as never,
+    messageRetryManager: {
+      addRecentMessage: (to: string, id: string, message: proto.IMessage) => {
+        retryCache.push({ to, id, message });
+      },
+    },
+    relayMessage: async (jid: string, message: proto.IMessage, options: Record<string, unknown>) => {
+      relayed.push({ jid, message, options });
+    },
+  };
+  (manager as unknown as { socket: unknown }).socket = fakeSocket;
+  (manager as unknown as { status: unknown }).status = {
+    state: 'CONNECTED', phone: null, lastConnectedAt: null, qrDataUrl: null, error: null,
+  };
+
+  await manager.sendGroupStatus('120363000000000000@g.us', { text: 'retry me' });
+  const messageId = String(relayed[0].options.messageId);
+  const cached = await (manager as unknown as {
+    statusRetryMessage: (key: { id: string }) => Promise<proto.IMessage | undefined>;
+  }).statusRetryMessage({ id: messageId });
+
+  assert.ok(cached?.groupStatusMessageV2, 'the retry fallback must hold the wrapped envelope');
+  assert.equal(cached?.groupStatusMessageV2?.message?.extendedTextMessage?.text, 'retry me');
+  assert.equal(retryCache.length, 1, 'the status retry cache entry must be overwritten with the wrapper');
+  assert.equal(retryCache[0].to, '120363000000000000@g.us');
+  assert.equal(retryCache[0].id, messageId);
+  assert.ok(retryCache[0].message.groupStatusMessageV2);
+});
+
 test('sendGroupStatus rejects a non-group JID and a disconnected account', async () => {
   const manager = new WhatsAppManager(loggerStub, {} as never, '/tmp/wa-manager-status-test', 'main');
   await assert.rejects(

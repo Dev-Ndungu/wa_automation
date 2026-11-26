@@ -880,7 +880,7 @@ export class CampaignService {
       }
     }
     const staleIds = existing
-      .filter((target) => !live.has(target.groupJid) && (target.status === 'QUEUED' || target.status === 'WAITING'))
+      .filter((target) => !live.has(target.groupJid) && (target.status === 'QUEUED' || target.status === 'WAITING' || target.status === 'FAILED'))
       .map((target) => target.id);
     if (staleIds.length > 0) {
       await db.update(campaignTargets).set({ status: 'CANCELLED', errorMessage: 'The account is no longer a member of this group.' })
@@ -1001,7 +1001,7 @@ export class CampaignService {
           const lastRunAt = now();
           const nextRunAt = nextScheduledRunAt(schedule, new Date(lastRunAt));
           await db.update(campaignTargets).set({ status: 'QUEUED', scheduledAt: nextRunAt, sentAt: null, errorMessage: null, attemptCount: 0 })
-            .where(eq(campaignTargets.campaignId, id));
+            .where(and(eq(campaignTargets.campaignId, id), ne(campaignTargets.status, 'CANCELLED')));
           await db.update(campaigns).set({ nextRunAt, lastRunAt, completedAt: null }).where(and(eq(campaigns.id, id), eq(campaigns.status, 'RUNNING')));
           continue;
         }

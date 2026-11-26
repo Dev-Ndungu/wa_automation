@@ -1,5 +1,5 @@
 import makeWASocket, { Browsers, DisconnectReason, fetchLatestWaWebVersion, generateMessageID, useMultiFileAuthState } from '@whiskeysockets/baileys';
-import type { BinaryNode, ConnectionState, GroupMetadata, WASocket } from '@whiskeysockets/baileys';
+import type { BinaryNode, ConnectionState, GroupMetadata, proto, WASocket } from '@whiskeysockets/baileys';
 import { buildGroupStatusInner, createGroupStatusWrapper, GROUP_STATUS_META } from './group-status.js';
 import type { GroupStatusContent, GroupStatusSecretMode } from './group-status.js';
 import { buildStatusAck } from './status-ack.js';
@@ -39,6 +39,8 @@ export class WhatsAppManager {
   private static readonly AUTH_MIRROR_INTERVAL_MS = 5 * 60_000;
 
   private readonly groupStatusWrapper = createGroupStatusWrapper();
+  // Message ID -> wrapped envelope, for rc14's getMessage retry fallback.
+  private readonly statusRetryMessages = new Map<string, proto.IMessage>();
   private socket: WASocket | null = null;
   private connectPromise: Promise<void> | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
@@ -194,9 +196,12 @@ export class WhatsAppManager {
         syncFullHistory: false,
         logger: this.logger as never,
         generateHighQualityLinkPreview: false,
-        // Retry resends come from this cache; the cached object is the inner
-        // message, which the wrapper below turns into the same envelope again.
+        // Keep rc14's retry cache for ordinary campaign messages. For status
+        // messages we overwrite the cached entry with the wrapped envelope after
+        // relay; rc14's retry branch bypasses patchMessageBeforeSending and
+        // cannot attach the plaintext meta node (known limitation).
         enableRecentMessageCache: true,
+        getMessage: async (key) => this.statusRetryMessage(key),
         patchMessageBeforeSending: async (message) => this.groupStatusWrapper.patch(message),
       });
       this.socket = socket;
@@ -370,13 +375,35 @@ export class WhatsAppManager {
     if (!this.socket || this.status.state !== 'CONNECTED') throw new Error('WhatsApp is not connected.');
     const inner = await buildGroupStatusInner(content, { upload: this.socket.waUploadToServer, logger: this.logger });
     this.groupStatusWrapper.mark(inner, options.messageSecret);
+    const messageId = generateMessageID();
+    // Cache the wrapped envelope before relaying: rc14's retry branch skips
+    // the patch and asks getMessage for the original message. The wrapper is
+    // recovered here; the plaintext meta node cannot be attached on retries.
+    const envelope = this.groupStatusWrapper.patch(inner);
+    this.statusRetryMessages.set(messageId, envelope);
+    if (this.statusRetryMessages.size > 2000) {
+      const oldest = this.statusRetryMessages.keys().next().value;
+      if (oldest) this.statusRetryMessages.delete(oldest);
+    }
     // Relay the inner message, never a pre-built wrapper: getMediaType must see
     // the top-level image/video so the <enc mediatype> attribute is set before
     // the patch wraps it into groupStatusMessageV2.
     await this.socket.relayMessage(groupJid, inner, {
-      messageId: generateMessageID(),
+      messageId,
       additionalNodes: [GROUP_STATUS_META],
     });
+    // rc14 caches the raw inner message during relay. Replace that entry with
+    // the wrapped envelope so a retry resends a status-shaped payload; the
+    // plaintext meta node still cannot be attached on retries.
+    const retryManager = (this.socket as unknown as {
+      messageRetryManager?: { addRecentMessage: (to: string, id: string, message: proto.IMessage) => void };
+    }).messageRetryManager;
+    retryManager?.addRecentMessage(groupJid, messageId, envelope);
+  }
+
+  /** rc14 retry fallback: return the wrapped envelope for a status message ID. */
+  private async statusRetryMessage(key: proto.IMessageKey): Promise<proto.IMessage | undefined> {
+    return key.id ? this.statusRetryMessages.get(key.id) : undefined;
   }
 
   private async ackStatusStanza(socket: WASocket, node: BinaryNode): Promise<void> {

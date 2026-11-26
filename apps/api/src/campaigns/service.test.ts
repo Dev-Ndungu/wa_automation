@@ -1011,3 +1011,48 @@ test('a Community fallback respects the message cooldown', async () => {
   assert.equal(sentCalls.length, 0);
   await service.stop(created.id);
 });
+
+test('reconciliation cancels a failed target whose group is no longer live', async () => {
+  await insertGroup('failed-left@g.us', 'Failed left');
+  const captured = await service.captureManualSource({ text: 'Failed left', label: 'Failed left' });
+  const created = await service.create({
+    name: 'Failed left', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['failed-left@g.us'], deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  } as never);
+  await db.update(campaignTargets).set({ status: 'FAILED', errorMessage: 'delivery failed' })
+    .where(eq(campaignTargets.campaignId, created.id));
+  const reconcile = (service as unknown as {
+    reconcileAllGroupTargets: (id: string, live: string[]) => Promise<void>;
+  }).reconcileAllGroupTargets.bind(service);
+  await reconcile(created.id, ['some-other-group@g.us']);
+  const [target] = await db.select().from(campaignTargets).where(eq(campaignTargets.campaignId, created.id));
+  assert.equal(target.status, 'CANCELLED');
+});
+
+test('a recurring pass does not resurrect a cancelled target', async () => {
+  await insertGroup('rollover-a@g.us', 'Rollover A');
+  await insertGroup('rollover-b@g.us', 'Rollover B');
+  const captured = await service.captureManualSource({ text: 'Rollover status', label: 'Rollover status' });
+  const created = await service.create({
+    name: 'Rollover status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['rollover-a@g.us', 'rollover-b@g.us'],
+    deliveryMode: 'GROUP_STATUS', schedule: { type: 'DAILY', time: '17:00' },
+  } as never);
+  try {
+    await service.start(created.id);
+    await db.update(campaignTargets).set({ status: 'CANCELLED', errorMessage: 'The account is no longer a member of this group.' })
+      .where(and(eq(campaignTargets.campaignId, created.id), eq(campaignTargets.groupJid, 'rollover-a@g.us')));
+    await db.update(campaignTargets).set({ status: 'SENT', sentAt: new Date().toISOString() })
+      .where(and(eq(campaignTargets.campaignId, created.id), eq(campaignTargets.groupJid, 'rollover-b@g.us')));
+    // Clear nextRunAt and wake the worker so it performs the recurring rollover now.
+    await service.runNow(created.id);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const rows = await db.select({ jid: campaignTargets.groupJid, status: campaignTargets.status })
+      .from(campaignTargets).where(eq(campaignTargets.campaignId, created.id));
+    const byJid = new Map(rows.map((row) => [row.jid, row.status]));
+    assert.equal(byJid.get('rollover-a@g.us'), 'CANCELLED');
+    assert.equal(byJid.get('rollover-b@g.us'), 'QUEUED');
+  } finally {
+    await service.stop(created.id).catch(() => undefined);
+  }
+});
