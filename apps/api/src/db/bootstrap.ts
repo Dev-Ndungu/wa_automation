@@ -59,6 +59,9 @@ export async function bootstrapDatabase(): Promise<void> {
   if (!(await hasColumn('groups', 'last_status_sent_at'))) {
     await db.run(sql`ALTER TABLE groups ADD COLUMN last_status_sent_at text`);
   }
+  if (!(await hasColumn('groups', 'community_parent_jid'))) {
+    await db.run(sql`ALTER TABLE groups ADD COLUMN community_parent_jid text`);
+  }
   await db.run(sql`CREATE TABLE IF NOT EXISTS discovered_links (id text PRIMARY KEY NOT NULL, account_id text NOT NULL REFERENCES whatsapp_accounts(id) ON DELETE CASCADE, invite_url text NOT NULL, invite_code text NOT NULL, source_group_jid text NOT NULL, source_group_name text NOT NULL, first_seen_at text NOT NULL, last_seen_at text NOT NULL, times_seen integer NOT NULL DEFAULT 1, source_message_id text, status text NOT NULL DEFAULT 'NEW', notes text, UNIQUE(account_id, invite_url))`);
   await db.run(sql`CREATE TABLE IF NOT EXISTS link_occurrences (id text PRIMARY KEY NOT NULL, link_id text NOT NULL REFERENCES discovered_links(id) ON DELETE CASCADE, source_group_jid text NOT NULL, occurred_at text NOT NULL)`);
   await db.run(sql`CREATE TABLE IF NOT EXISTS source_messages (id text PRIMARY KEY NOT NULL, account_id text NOT NULL REFERENCES whatsapp_accounts(id) ON DELETE CASCADE, chat_jid text NOT NULL, message_id text NOT NULL, payload text NOT NULL, preview text NOT NULL, created_at text NOT NULL, UNIQUE(account_id, chat_jid, message_id))`);

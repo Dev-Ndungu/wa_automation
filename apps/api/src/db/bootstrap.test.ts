@@ -20,6 +20,7 @@ test('bootstrap adds group-status columns and does not pause existing status cam
   assert.ok(campaignColumns.some((column) => column.name === 'target_all_groups'));
   const groupColumns = await db.all<{ name: string }>(sql`PRAGMA table_info(groups)`);
   assert.ok(groupColumns.some((column) => column.name === 'last_status_sent_at'));
+  assert.ok(groupColumns.some((column) => column.name === 'community_parent_jid'));
 
   const timestamp = new Date().toISOString();
   await db.run(sql`INSERT INTO source_messages (id, account_id, chat_jid, message_id, payload, preview, created_at)

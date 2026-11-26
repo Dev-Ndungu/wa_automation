@@ -44,6 +44,7 @@ export const groups = sqliteTable('groups', {
   isExcluded: integer('is_excluded', { mode: 'boolean' }).notNull().default(false),
   lastCampaignSentAt: text('last_campaign_sent_at'),
   lastStatusSentAt: text('last_status_sent_at'),
+  communityParentJid: text('community_parent_jid'),
   lastSyncedAt: text('last_synced_at'),
   joinedAt: text('joined_at'),
   ...timestamps,

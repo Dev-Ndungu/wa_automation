@@ -394,7 +394,7 @@ export class WhatsAppManager {
    * Name and description are only overwritten when WhatsApp provides them, so
    * a partial event (for example groups.update) can never blank a known name.
    */
-  private async upsertGroups(metadata: Array<{ id: string; subject?: string; desc?: string }>): Promise<void> {
+  private async upsertGroups(metadata: Array<{ id: string; subject?: string; desc?: string; linkedParent?: string }>): Promise<void> {
     if (metadata.length === 0) return;
     const syncedAt = now();
     // One transaction for the whole sync: a few hundred autocommitted upserts
@@ -403,12 +403,14 @@ export class WhatsAppManager {
       for (const group of metadata) {
         await tx.insert(groups).values({
           id: randomUUID(), accountId: this.accountId, whatsappGroupJid: group.id, name: group.subject || group.id, description: group.desc ?? null,
+          communityParentJid: group.linkedParent ?? null,
           isTarget: false, isScannerEnabled: true, isExcluded: false, lastSyncedAt: syncedAt, createdAt: syncedAt, updatedAt: syncedAt,
         }).onConflictDoUpdate({
           target: [groups.accountId, groups.whatsappGroupJid],
           set: {
             ...(group.subject !== undefined ? { name: group.subject } : {}),
             ...(group.desc !== undefined ? { description: group.desc } : {}),
+            ...(group.linkedParent !== undefined ? { communityParentJid: group.linkedParent } : {}),
             lastSyncedAt: syncedAt, updatedAt: syncedAt,
           },
         });
