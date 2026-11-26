@@ -991,3 +991,198 @@ Expected: `delivery_mode` and `target_all_groups` in the campaigns columns; `las
 - [ ] **Step 3: Report the state**
 
 Summarize for the operator: the spike result, the video support flag, the tests that pass, and the remaining rollout gates (test group, pilot 5–10 groups, then all groups). Do not start a live all-groups campaign as part of this plan; that is the operator's rollout decision.
+
+---
+
+## Task 11: Community-link detection and storage
+
+Added after the live spike: WhatsApp silently drops group statuses in
+Community-linked groups. The operator chose a normal-message fallback (design
+§7.10), which needs the link stored locally.
+
+**Files:**
+- Modify: `apps/api/src/db/schema.ts`
+- Modify: `apps/api/src/db/bootstrap.ts`
+- Modify: `apps/api/src/whatsapp/manager.ts`
+- Test: `apps/api/src/db/bootstrap.test.ts`
+
+**Interfaces:**
+- `groups.communityParentJid: text('community_parent_jid')`
+- `upsertGroups` accepts `linkedParent?: string` and stores it.
+
+- [ ] **Step 1: Extend the bootstrap test**
+
+Add to the column assertions:
+
+```ts
+assert.ok(groupColumns.some((column) => column.name === 'community_parent_jid'));
+```
+
+Run: `cd apps/api && npx tsx --test src/db/bootstrap.test.ts`
+Expected: FAIL — column missing.
+
+- [ ] **Step 2: Implement**
+
+`schema.ts` groups: add `communityParentJid: text('community_parent_jid')`.
+`bootstrap.ts`: after `last_status_sent_at`, add the same `ALTER TABLE groups ADD COLUMN community_parent_jid text` guard.
+`manager.ts` `upsertGroups`: accept `linkedParent?: string`; insert `communityParentJid: group.linkedParent ?? null`; in the conflict update add `...(group.linkedParent !== undefined ? { communityParentJid: group.linkedParent } : {})`.
+
+- [ ] **Step 3: Run the test and suite**
+
+Run: `cd apps/api && npx tsx --test src/db/bootstrap.test.ts`
+Expected: PASS.
+Run: `npm test --workspace=@wa-control/api`
+Expected: PASS.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add apps/api/src/db/schema.ts apps/api/src/db/bootstrap.ts apps/api/src/whatsapp/manager.ts apps/api/src/db/bootstrap.test.ts
+git commit -m "feat: store community group links
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
+```
+
+---
+
+## Task 12: Community fallback delivery
+
+**Files:**
+- Modify: `apps/api/src/campaigns/service.ts`
+- Test: `apps/api/src/campaigns/service.test.ts`
+
+**Interfaces:**
+- `insertGroup` test helper accepts `communityParentJid`.
+- A status target with `communityParentJid` receives `sendMessage` (normal group message) instead of `sendGroupStatus`.
+- Fallback success stamps `lastStatusSentAt` and `lastCampaignSentAt`.
+- Fallback cooldown uses the later of the two timestamps plus the status 48–96 h draw.
+
+- [ ] **Step 1: Write the failing tests**
+
+Extend `insertGroup`'s `extra` type with `communityParentJid?: string | null` and insert `communityParentJid: extra?.communityParentJid ?? null`.
+
+```ts
+test('a status campaign sends a normal message to a Community-linked group', async () => {
+  await insertGroup('community-status@g.us', 'Community status', { communityParentJid: 'parent@g.us' });
+  await insertGroup('normal-status@g.us', 'Normal status');
+  const captured = await service.captureManualSource({ text: 'Fallback status', label: 'Fallback status' });
+  const created = await service.create({
+    name: 'Fallback status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['community-status@g.us', 'normal-status@g.us'],
+    deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  } as never);
+  statusCalls.length = 0;
+  sentCalls.length = 0;
+  await service.start(created.id);
+  await waitForTargetsSent(created.id, 10_000, 2);
+
+  assert.deepEqual(statusCalls.map((call) => call.jid), ['normal-status@g.us']);
+  assert.deepEqual(sentCalls.map((call) => call.jid), ['community-status@g.us']);
+  assert.deepEqual(sentCalls[0].content, { text: 'Fallback status' });
+
+  const rows = await db.select({ jid: groups.whatsappGroupJid, lastStatusSentAt: groups.lastStatusSentAt, lastCampaignSentAt: groups.lastCampaignSentAt })
+    .from(groups).where(inArray(groups.whatsappGroupJid, ['community-status@g.us', 'normal-status@g.us']));
+  const community = rows.find((row) => row.jid === 'community-status@g.us')!;
+  const normal = rows.find((row) => row.jid === 'normal-status@g.us')!;
+  assert.ok(community.lastStatusSentAt);
+  assert.ok(community.lastCampaignSentAt);
+  assert.ok(normal.lastStatusSentAt);
+  assert.equal(normal.lastCampaignSentAt, null);
+});
+
+test('a Community fallback respects the message cooldown', async () => {
+  await insertGroup('community-cool@g.us', 'Community cool', {
+    communityParentJid: 'parent@g.us',
+    lastCampaignSentAt: new Date(Date.now() - 3_600_000).toISOString(),
+  });
+  const captured = await service.captureManualSource({ text: 'Community cool', label: 'Community cool' });
+  const created = await service.create({
+    name: 'Community cool', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['community-cool@g.us'], deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  } as never);
+  statusCalls.length = 0;
+  sentCalls.length = 0;
+  await service.start(created.id);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const [target] = await db.select().from(campaignTargets).where(eq(campaignTargets.campaignId, created.id));
+  assert.equal(target.status, 'WAITING');
+  const delay = Date.parse(target.scheduledAt!) - Date.now();
+  assert.ok(delay >= 47 * 3_600_000 && delay <= 97 * 3_600_000);
+  assert.equal(sentCalls.length, 0);
+  await service.stop(created.id);
+});
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cd apps/api && npx tsx --test --test-name-pattern="Community-linked group|Community fallback" src/campaigns/service.test.ts`
+Expected: FAIL — the community target still receives a status.
+
+- [ ] **Step 3: Implement**
+
+`campaigns/service.ts`:
+- Add `communityParentJid: groups.communityParentJid` to the recipient select.
+- After the exclusion check, compute `const fallbackMessage = statusMode && Boolean(recipient.communityParentJid);`.
+- Cooldown: for status mode, use `lastStatusSentAt`; for a fallback target, use the later of `lastStatusSentAt` and `lastCampaignSentAt`. Keep the status 48–96 h draw.
+- Send branch: when `statusMode`, pick the source and build the content once. If `fallbackMessage`, call a new `private async sendFallbackMessage(socket: WASocket, groupJid: string, content: GroupStatusContent)` that sends `{ text }`, `{ image, caption, mimetype: 'image/jpeg' }`, or `{ video, caption, mimetype: 'video/mp4' }` through `socket.sendMessage`, inside `enqueueAccountSend`. Otherwise call `sendGroupStatus`.
+- Success: for status mode, stamp `lastStatusSentAt`; also stamp `lastCampaignSentAt` when `fallbackMessage`.
+- Add `import type { WASocket } from '@whiskeysockets/baileys';`.
+
+- [ ] **Step 4: Run the tests and the suite**
+
+Run: `cd apps/api && npx tsx --test --test-name-pattern="Community-linked group|Community fallback" src/campaigns/service.test.ts`
+Expected: PASS.
+Run: `npm test --workspace=@wa-control/api`
+Expected: PASS.
+Run: `npm run check`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add apps/api/src/campaigns/service.ts apps/api/src/campaigns/service.test.ts
+git commit -m "feat: fall back to a group message for community groups
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
+```
+
+---
+
+## Task 13: Community fallback UI
+
+**Files:**
+- Modify: `apps/api/src/accounts/service.ts`
+- Modify: `apps/web/src/main.tsx`
+
+**Interfaces:**
+- `GET /api/groups` already returns every group column, including `communityParentJid`.
+- `editGroupsFor` includes `communityParentJid`.
+- The status form shows the count of Community-linked targets.
+
+- [ ] **Step 1: Include the field in edit groups**
+
+In `accounts/service.ts` `editGroupsFor`, add `communityParentJid: groups.communityParentJid` to the select and to the returned object (initial value from the row; when merging, keep the first non-null).
+
+- [ ] **Step 2: Show it in the dashboard**
+
+In `main.tsx`:
+- Add `communityParentJid?: string | null` to `type Group`.
+- On the Groups page, render `<span className="badge">COMMUNITY → MESSAGE</span>` when set.
+- In the campaign form, when `deliveryMode === 'GROUP_STATUS'`, show a hint with the count of `campaignGroups.filter((group) => group.communityParentJid).length` and explain they receive a normal message instead of a status.
+- In the group picker rows, append a small `· community fallback` marker for those groups.
+
+- [ ] **Step 3: Verify**
+
+Run: `npm run check`
+Expected: PASS.
+Run: `npm run build`
+Expected: PASS.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add apps/api/src/accounts/service.ts apps/web/src/main.tsx
+git commit -m "feat: show community fallback in the dashboard
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
+```

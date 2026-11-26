@@ -432,6 +432,29 @@ spread of the campaign row.
 - **Campaign restart (process crash):** `recover()` marks in-flight rows FAILED
   and never resends automatically, as today. The operator re-runs.
 
+### 7.10 Community-linked groups (added after the live spike)
+
+The live spike proved text, image and video render in a normal group and are
+silently dropped in the UOEM group, whose metadata has `linkedParent` set
+(Community-linked). WhatsApp enforces this server-side; the operator chose a
+message fallback so every group is reached.
+
+- `groups.community_parent_jid` stores `GroupMetadata.linkedParent`, refreshed by
+  the group sync/upsert.
+- A status campaign still targets every non-excluded group.
+- The worker sends a group status to normal groups. For a target whose
+  `community_parent_jid` is set, it sends the same randomly selected source as a
+  **normal group message** through `enqueueAccountSend` (text, image, or video).
+- The fallback stamps both `last_status_sent_at` and `last_campaign_sent_at`.
+  Its cooldown uses the later of the two timestamps plus the status 48–96 h
+  draw, so the status cadence and the normal message cooldown are both
+  respected.
+- A fallback failure counts toward the same circuit breaker.
+- The dashboard marks Community-linked groups and shows how many status-campaign
+  targets will receive a message instead of a status.
+- Semantics note: a Community group receives a chat message, not a 24-hour
+  status; members may be notified by the message.
+
 ## 8. Safety controls
 
 These are fixed in `safety/limits.ts` and not operator-configurable, matching the
@@ -547,6 +570,8 @@ the design/implementation notes.
   dropped; the pilot should include one if available.
 - **Budget coupling.** Status sends consume the same 300/day budget as message
   campaigns. Running both means neither gets the full cap.
+- **Community fallback is a normal chat message.** Community-linked groups get a
+  message, not a 24-hour status; members may be notified.
 - **The prior implementation did not work as written.** It is a warning, not a
   proven base.
 
