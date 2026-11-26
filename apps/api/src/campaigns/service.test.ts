@@ -23,9 +23,10 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { rmSync } from 'node:fs';
 import test, { after, before } from 'node:test';
-import { eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import type { FastifyBaseLogger } from 'fastify';
-import { actionLog, campaignSources, campaignTargets, campaigns, groups, operationalLogs, sourceMessages } from '../db/schema.js';
+import { actionLog, campaignSources, campaignTargets, campaigns, groups, operationalLogs, sourceMessages, whatsappAccounts } from '../db/schema.js';
+import { combineCampaignShards } from './coordinator.js';
 import type { WhatsAppManager, WhatsAppStatus } from '../whatsapp/manager.js';
 
 const TINY_PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
@@ -35,6 +36,8 @@ type SentCall = { jid: string; content: Record<string, unknown> };
 const sentCalls: SentCall[] = [];
 // Delivery times kept in lockstep with sentCalls, for pacing assertions.
 const sendTimes: number[] = [];
+const statusCalls: Array<{ jid: string; content: unknown }> = [];
+let liveGroupJids: string[] = [];
 const noop = () => {};
 
 // Stub socket: every send is recorded in sentCalls, in delivery order.
@@ -45,6 +48,10 @@ const whatsappStub = {
       sendTimes.push(Date.now());
     },
   }),
+  sendGroupStatus: async (jid: string, content: unknown) => {
+    statusCalls.push({ jid, content });
+  },
+  participatingGroupJids: async () => liveGroupJids,
   getStatus: () => ({ state: 'CONNECTED', phone: null, lastConnectedAt: null, qrDataUrl: null, error: null }),
   subscribe: () => noop,
   subscribeGroupJoined: () => noop,
@@ -69,6 +76,8 @@ const service = new CampaignService(whatsappStub, loggerStub, 'main', {
   // Sends are gated to 06:00-23:00 EAT in production; the suite must not depend
   // on the hour it runs at, so the window is always open here.
   sendWindowDelayMs: () => 0,
+  // Reconcile every worker pass so the targetAllGroups tests are deterministic.
+  statusReconcileIntervalMs: 0,
 });
 
 before(async () => {
@@ -81,11 +90,11 @@ after(() => {
   }
 });
 
-async function insertGroup(jid: string, name: string, extra?: { joinedAt?: string | null; lastCampaignSentAt?: string | null }): Promise<void> {
+async function insertGroup(jid: string, name: string, extra?: { joinedAt?: string | null; lastCampaignSentAt?: string | null; communityParentJid?: string | null }, accountId = 'main'): Promise<void> {
   const timestamp = new Date().toISOString();
   await db.insert(groups).values({
     id: randomUUID(),
-    accountId: 'main',
+    accountId,
     whatsappGroupJid: jid,
     name,
     description: null,
@@ -94,15 +103,16 @@ async function insertGroup(jid: string, name: string, extra?: { joinedAt?: strin
     updatedAt: timestamp,
     joinedAt: extra?.joinedAt ?? null,
     lastCampaignSentAt: extra?.lastCampaignSentAt ?? null,
+    communityParentJid: extra?.communityParentJid ?? null,
   });
 }
 
-async function waitForTargetsSent(campaignId: string, timeoutMs = 10_000): Promise<void> {
+async function waitForTargetsSent(campaignId: string, timeoutMs = 10_000, expectedTargets = 2): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const rows = await db.select({ status: campaignTargets.status }).from(campaignTargets)
       .where(eq(campaignTargets.campaignId, campaignId));
-    if (rows.length === 2 && rows.every((row) => row.status === 'SENT')) return;
+    if (rows.length === expectedTargets && rows.every((row) => row.status === 'SENT')) return;
     if (Date.now() >= deadline) {
       assert.fail(`campaign ${campaignId} targets did not reach SENT within ${timeoutMs}ms. Current statuses: ${JSON.stringify(rows)}`);
     }
@@ -211,6 +221,62 @@ test('multi-file capture sends image, video, image in order to every target', as
     assert.equal(sentCalls[base + 2].jid, jid);
     assert.ok(Buffer.isBuffer(sentCalls[base + 2].content.image), `call ${base + 2} must carry an image Buffer`);
   }
+});
+
+test('distributed shards share the owner source and combine into one card', async () => {
+  const secondAccountId = `second-${randomUUID()}`;
+  const timestamp = new Date().toISOString();
+  await db.insert(whatsappAccounts).values({ id: secondAccountId, name: `Second ${secondAccountId}`, phone: null, createdAt: timestamp, updatedAt: timestamp });
+  await insertGroup('split-a@g.us', 'Split A');
+  await insertGroup('split-b@g.us', 'Split B', undefined, secondAccountId);
+
+  const captured = await service.captureManualSource({ text: 'Split caption', label: 'Split' });
+  const plan = await service.plan({
+    name: 'Split campaign',
+    sourceMessageId: undefined,
+    sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['split-a@g.us', 'split-b@g.us'],
+    schedule: { type: 'ONCE' },
+  });
+  const second = new CampaignService(whatsappStub, loggerStub, secondAccountId);
+  const firstShard = await service.createFromPlan(plan, ['split-a@g.us'], { distributionId: 'distribution-1', sourceAccountId: 'main' });
+  const secondShard = await second.createFromPlan(plan, ['split-b@g.us'], { distributionId: 'distribution-1', sourceAccountId: 'main' });
+
+  assert.equal(firstShard.distributionId, 'distribution-1');
+  assert.equal(secondShard.sourceContent?.text, 'Split caption', 'a shard can read the owner source without duplicating it');
+  const combined = combineCampaignShards(
+    [firstShard, secondShard] as never,
+    new Map([['main', 'Main'], [secondAccountId, 'Second']]),
+  );
+  assert.equal(combined.targets.length, 2);
+  assert.deepEqual(combined.accounts.map((account) => account.name), ['Main', 'Second']);
+});
+
+test('campaign list stays lightweight while the detail keeps the editable source', async () => {
+  const captured = await service.captureManualSource({
+    text: 'List caption',
+    label: 'List summary',
+    files: [{ kind: 'image', dataUrl: TINY_PNG }],
+  });
+  const campaign = await service.create({
+    name: 'List summary campaign',
+    sourceMessageId: undefined,
+    sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['groupa@g.us'],
+    schedule: { type: 'ONCE' },
+  });
+
+  // The dashboard polls the list and refreshes it after every action: it must
+  // not include the stored caption, which sits after the media payload.
+  const summary = (await service.list()).find((entry) => entry.id === campaign.id);
+  assert.ok(summary);
+  assert.deepEqual(summary.sources.map((source) => source.kind), ['image']);
+  assert.equal(summary.sourceContent, null);
+
+  // Editing loads the detail endpoint, which still prefills the source.
+  const detail = await service.get(campaign.id);
+  assert.equal(detail.sourceContent?.text, 'List caption');
+  assert.equal(detail.sourceContent?.hasImage, true);
 });
 
 test('delete removes the campaign rows and keeps shared source messages', async () => {
@@ -392,12 +458,8 @@ test('daily send budget pauses the campaign before any message goes out', async 
   // campaign back to RUNNING and the held message goes out without a resume
   // call from anyone.
   await db.delete(actionLog).where(inArray(actionLog.id, budgetRowIds));
-  await waitForCampaignStatus(campaign.id, 'RUNNING');
-  const [resumed] = await db.select({ pauseReason: campaigns.pauseReason, autoResumeAt: campaigns.autoResumeAt })
-    .from(campaigns).where(eq(campaigns.id, campaign.id));
-  assert.equal(resumed.pauseReason, null, 'an auto-resumed campaign must not keep its pause reason');
-  assert.equal(resumed.autoResumeAt, null, 'an auto-resumed campaign must not keep its resume deadline');
-
+  // The resumed campaign can deliver and complete before a poll observes the
+  // brief RUNNING state, so wait for the held message instead of that state.
   const deadline = Date.now() + 5_000;
   for (;;) {
     const [target] = await db.select({ status: campaignTargets.status }).from(campaignTargets).where(eq(campaignTargets.campaignId, campaign.id));
@@ -405,6 +467,11 @@ test('daily send budget pauses the campaign before any message goes out', async 
     if (Date.now() >= deadline) assert.fail(`the auto-resumed campaign did not deliver; target status: ${target.status}`);
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
+  const [resumed] = await db.select({ status: campaigns.status, pauseReason: campaigns.pauseReason, autoResumeAt: campaigns.autoResumeAt })
+    .from(campaigns).where(eq(campaigns.id, campaign.id));
+  assert.ok(['RUNNING', 'COMPLETED'].includes(resumed.status), `an auto-resumed campaign must be live or complete, not ${resumed.status}`);
+  assert.equal(resumed.pauseReason, null, 'an auto-resumed campaign must not keep its pause reason');
+  assert.equal(resumed.autoResumeAt, null, 'an auto-resumed campaign must not keep its resume deadline');
   assert.equal(sentCalls.length, 1, 'exactly the held message goes out after the budget resets');
 
   const resumeLogs = await db.select({ event: operationalLogs.event, details: operationalLogs.details }).from(operationalLogs)
@@ -665,4 +732,327 @@ test('circuit breaker pauses every running campaign after consecutive send failu
   assert.equal(breakerService.getCircuitWarning(), null, 'an operator Run now must clear the account warning');
   const [stillPausedB] = await db.select({ status: campaigns.status }).from(campaigns).where(eq(campaigns.id, campaignB.id));
   assert.equal(stillPausedB.status, 'PAUSED', 'running one campaign again must not resume the others');
+});
+
+test('the daily send cap allows exactly SEND_DAILY_LIMIT sends and refuses the next', async () => {
+  // Prove the boundary rather than just "at the limit": with one send still
+  // available the message must go out, and the very next one must be refused.
+  const clearSends = () => db.delete(actionLog)
+    .where(and(eq(actionLog.accountId, 'main'), eq(actionLog.action, 'SEND')));
+  await clearSends();
+  const at = new Date().toISOString();
+  const seeded: string[] = [];
+  const rows = Array.from({ length: SEND_DAILY_LIMIT - 1 }, () => {
+    const id = randomUUID();
+    seeded.push(id);
+    return { id, accountId: 'main', action: 'SEND' as const, createdAt: at };
+  });
+  await db.insert(actionLog).values(rows);
+
+  const lastAllowedJid = `cap-last-${randomUUID()}@g.us`;
+  const blockedJid = `cap-blocked-${randomUUID()}@g.us`;
+  await insertGroup(lastAllowedJid, 'Cap last');
+  await insertGroup(blockedJid, 'Cap blocked');
+  const captured = await service.captureManualSource({ text: 'Cap probe', label: 'Cap' });
+
+  // Send #SEND_DAILY_LIMIT: one slot left, so this must be delivered.
+  const allowed = await service.create({
+    name: 'Cap allowed', sourceMessageId: undefined, sourceMessageIds: [captured.sources[0].id],
+    groupJids: [lastAllowedJid], schedule: { type: 'ONCE' }, shuffleOrder: false,
+  });
+  sentCalls.length = 0;
+  await service.runNow(allowed.id);
+  await waitForTargetsSent(allowed.id, 10_000, 1);
+  assert.deepEqual(sentCalls.map((call) => call.jid), [lastAllowedJid], 'the send that fills the cap must still be delivered');
+
+  // The delivered send recorded itself, so the budget is now exactly full.
+  const blocked = await service.create({
+    name: 'Cap blocked', sourceMessageId: undefined, sourceMessageIds: [captured.sources[0].id],
+    groupJids: [blockedJid], schedule: { type: 'ONCE' }, shuffleOrder: false,
+  });
+  sentCalls.length = 0;
+  await service.runNow(blocked.id);
+  await waitForPause(blocked.id);
+  assert.equal(sentCalls.length, 0, 'the send after the cap must never be delivered');
+
+  await db.delete(actionLog).where(inArray(actionLog.id, seeded));
+  await clearSends();
+});
+
+test('a status campaign expands targetAllGroups to non-excluded groups', async () => {
+  await db.update(groups).set({ isExcluded: true });
+  await insertGroup('all-one@g.us', 'All one');
+  await insertGroup('all-excluded@g.us', 'All excluded');
+  await db.update(groups).set({ isExcluded: true }).where(eq(groups.whatsappGroupJid, 'all-excluded@g.us'));
+  const captured = await service.captureManualSource({ text: 'All groups status', label: 'All groups status' });
+  const plan = await service.plan({
+    name: 'All groups status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: [], deliveryMode: 'GROUP_STATUS', targetAllGroups: true,
+  } as never);
+  assert.deepEqual(plan.groupJids.sort(), ['all-one@g.us']);
+  assert.equal(plan.deliveryMode, 'GROUP_STATUS');
+  assert.equal(plan.targetAllGroups, true);
+});
+
+test('targetAllGroups is rejected for a message campaign', async () => {
+  const captured = await service.captureManualSource({ text: 'Message source', label: 'Message source' });
+  await assert.rejects(
+    () => service.plan({
+      name: 'Bad', sourceMessageIds: [captured.sources[0].id],
+      groupJids: ['all-one@g.us'], deliveryMode: 'MESSAGE', targetAllGroups: true,
+    } as never),
+    /only available for group-status/,
+  );
+});
+
+test('an unknown delivery mode is rejected', async () => {
+  const captured = await service.captureManualSource({ text: 'Mode source', label: 'Mode source' });
+  await assert.rejects(
+    () => service.plan({
+      name: 'Bad', sourceMessageIds: [captured.sources[0].id],
+      groupJids: ['all-one@g.us'], deliveryMode: 'STATUS',
+    } as never),
+    /deliveryMode must be MESSAGE or GROUP_STATUS/,
+  );
+});
+
+test('a status campaign rejects text over 1024 characters', async () => {
+  const captured = await service.captureManualSource({ text: 'x'.repeat(1025), label: 'Long status' });
+  await assert.rejects(
+    () => service.plan({
+      name: 'Long status', sourceMessageIds: [captured.sources[0].id],
+      groupJids: ['all-one@g.us'], deliveryMode: 'GROUP_STATUS',
+    } as never),
+    /at most 1024/,
+  );
+});
+
+test('a status campaign persists its delivery mode and rejects a mode change', async () => {
+  await insertGroup('persisted-status@g.us', 'Persisted status');
+  const captured = await service.captureManualSource({ text: 'Persisted status', label: 'Persisted status' });
+  const created = await service.create({
+    name: 'Persisted status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['persisted-status@g.us'], deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  } as never);
+  assert.equal(created.deliveryMode, 'GROUP_STATUS');
+  await assert.rejects(
+    () => service.update(created.id, {
+      name: 'Persisted status', sourceMessageIds: [captured.sources[0].id],
+      groupJids: ['persisted-status@g.us'], deliveryMode: 'MESSAGE', schedule: { type: 'ONCE' },
+    } as never),
+    /cannot change its delivery mode/,
+  );
+});
+
+test('a group-status campaign posts one status per group and stamps last_status_sent_at', async () => {
+  await insertGroup('status-one@g.us', 'Status one');
+  await insertGroup('status-two@g.us', 'Status two');
+  const captured = await service.captureManualSource({ text: 'Status text', label: 'Status text' });
+  const created = await service.create({
+    name: 'Status run', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['status-one@g.us', 'status-two@g.us'], deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  } as never);
+  statusCalls.length = 0;
+  await service.start(created.id);
+  await waitForTargetsSent(created.id, 10_000, 2);
+
+  assert.equal(statusCalls.length, 2);
+  assert.deepEqual(statusCalls.map((call) => call.jid).sort(), ['status-one@g.us', 'status-two@g.us']);
+  assert.deepEqual(statusCalls[0].content, { text: 'Status text' });
+  const rows = await db.select({ jid: groups.whatsappGroupJid, lastStatusSentAt: groups.lastStatusSentAt, lastCampaignSentAt: groups.lastCampaignSentAt })
+    .from(groups).where(inArray(groups.whatsappGroupJid, ['status-one@g.us', 'status-two@g.us']));
+  assert.ok(rows.every((row) => row.lastStatusSentAt));
+  assert.ok(rows.every((row) => row.lastCampaignSentAt === null));
+});
+
+test('a group inside the status cooldown is parked, not sent', async () => {
+  await insertGroup('cooled-status@g.us', 'Cooled status', { lastCampaignSentAt: null });
+  await db.update(groups).set({ lastStatusSentAt: new Date(Date.now() - 3_600_000).toISOString() })
+    .where(eq(groups.whatsappGroupJid, 'cooled-status@g.us'));
+  const captured = await service.captureManualSource({ text: 'Cooled status', label: 'Cooled status' });
+  const created = await service.create({
+    name: 'Cooled status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['cooled-status@g.us'], deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  } as never);
+  statusCalls.length = 0;
+  await service.start(created.id);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const [target] = await db.select().from(campaignTargets).where(eq(campaignTargets.campaignId, created.id));
+  assert.equal(target.status, 'WAITING');
+  const delay = Date.parse(target.scheduledAt!) - Date.now();
+  assert.ok(delay >= 47 * 3_600_000 && delay <= 97 * 3_600_000);
+  assert.equal(statusCalls.length, 0);
+  await service.stop(created.id);
+});
+
+test('starting a status campaign while disconnected is rejected', async () => {
+  await insertGroup('offline-status@g.us', 'Offline status');
+  const offlineStub = { ...whatsappStub, getStatus: () => ({ state: 'DISCONNECTED', phone: null, lastConnectedAt: null, qrDataUrl: null, error: null }) } as unknown as WhatsAppManager;
+  const offline = new CampaignService(offlineStub, loggerStub, 'main', {
+    minSendGapSeconds: 0, sendGapSeconds: () => 0, warmupSeconds: () => 0,
+    reconnectSettleMs: () => 0, dailyBudgetResetMs: () => 300, sendWindowDelayMs: () => 0,
+  });
+  const captured = await service.captureManualSource({ text: 'Offline status', label: 'Offline status' });
+  const created = await service.create({
+    name: 'Offline status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['offline-status@g.us'], deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  } as never);
+  await assert.rejects(() => offline.start(created.id), /must be connected/);
+});
+
+test('targetAllGroups adds a newly synced group', async () => {
+  await db.update(groups).set({ isExcluded: true });
+  await insertGroup('all-live@g.us', 'All live');
+  const captured = await service.captureManualSource({ text: 'All live status', label: 'All live status' });
+  const created = await service.create({
+    name: 'All live status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: [], deliveryMode: 'GROUP_STATUS', targetAllGroups: true, schedule: { type: 'ONCE' },
+  } as never);
+  await insertGroup('all-new@g.us', 'All new');
+  liveGroupJids = ['all-live@g.us', 'all-new@g.us'];
+  await service.start(created.id);
+  await waitForTargetsSent(created.id, 10_000, 2);
+  const jids = (await db.select({ jid: campaignTargets.groupJid }).from(campaignTargets)
+    .where(eq(campaignTargets.campaignId, created.id))).map((row) => row.jid).sort();
+  assert.deepEqual(jids, ['all-live@g.us', 'all-new@g.us']);
+});
+
+test('reconciliation cancels a queued target whose group is no longer live', async () => {
+  await insertGroup('left-group@g.us', 'Left group');
+  const captured = await service.captureManualSource({ text: 'Left status', label: 'Left status' });
+  const created = await service.create({
+    name: 'Left status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['left-group@g.us'], deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  } as never);
+  const reconcile = (service as unknown as {
+    reconcileAllGroupTargets: (id: string, live: string[]) => Promise<void>;
+  }).reconcileAllGroupTargets.bind(service);
+  await reconcile(created.id, ['some-other-group@g.us']);
+  const [target] = await db.select().from(campaignTargets).where(eq(campaignTargets.campaignId, created.id));
+  assert.equal(target.status, 'CANCELLED');
+  assert.match(target.errorMessage ?? '', /no longer a member/);
+});
+
+test('an empty live group list does not cancel targets', async () => {
+  await insertGroup('kept-group@g.us', 'Kept group');
+  const captured = await service.captureManualSource({ text: 'Kept status', label: 'Kept status' });
+  const created = await service.create({
+    name: 'Kept status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['kept-group@g.us'], deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  } as never);
+  const reconcile = (service as unknown as {
+    reconcileAllGroupTargets: (id: string, live: string[]) => Promise<void>;
+  }).reconcileAllGroupTargets.bind(service);
+  await reconcile(created.id, []);
+  const [target] = await db.select().from(campaignTargets).where(eq(campaignTargets.campaignId, created.id));
+  assert.equal(target.status, 'QUEUED');
+});
+
+test('a status campaign accepts a video after the live spike proves it', async () => {
+  await insertGroup('video-status@g.us', 'Video status');
+  const captured = await service.captureManualSource({
+    text: 'Video status',
+    label: 'Video status',
+    files: [{ kind: 'video', dataUrl: TINY_VIDEO, name: 'tiny.mp4' }],
+  } as never);
+  const plan = await service.plan({
+    name: 'Video status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['video-status@g.us'], deliveryMode: 'GROUP_STATUS',
+  } as never);
+  assert.equal(plan.deliveryMode, 'GROUP_STATUS');
+});
+
+test('a status campaign sends a normal message to a Community-linked group', async () => {
+  await insertGroup('community-status@g.us', 'Community status', { communityParentJid: 'parent@g.us' });
+  await insertGroup('normal-status@g.us', 'Normal status');
+  const captured = await service.captureManualSource({ text: 'Fallback status', label: 'Fallback status' });
+  const created = await service.create({
+    name: 'Fallback status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['community-status@g.us', 'normal-status@g.us'],
+    deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  } as never);
+  statusCalls.length = 0;
+  sentCalls.length = 0;
+  await service.start(created.id);
+  await waitForTargetsSent(created.id, 10_000, 2);
+
+  assert.deepEqual(statusCalls.map((call) => call.jid), ['normal-status@g.us']);
+  assert.deepEqual(sentCalls.map((call) => call.jid), ['community-status@g.us']);
+  assert.deepEqual(sentCalls[0].content, { text: 'Fallback status' });
+
+  const rows = await db.select({ jid: groups.whatsappGroupJid, lastStatusSentAt: groups.lastStatusSentAt, lastCampaignSentAt: groups.lastCampaignSentAt })
+    .from(groups).where(inArray(groups.whatsappGroupJid, ['community-status@g.us', 'normal-status@g.us']));
+  const community = rows.find((row) => row.jid === 'community-status@g.us')!;
+  const normal = rows.find((row) => row.jid === 'normal-status@g.us')!;
+  assert.ok(community.lastStatusSentAt);
+  assert.ok(community.lastCampaignSentAt);
+  assert.ok(normal.lastStatusSentAt);
+  assert.equal(normal.lastCampaignSentAt, null);
+});
+
+test('a Community fallback respects the message cooldown', async () => {
+  await insertGroup('community-cool@g.us', 'Community cool', {
+    communityParentJid: 'parent@g.us',
+    lastCampaignSentAt: new Date(Date.now() - 3_600_000).toISOString(),
+  });
+  const captured = await service.captureManualSource({ text: 'Community cool', label: 'Community cool' });
+  const created = await service.create({
+    name: 'Community cool', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['community-cool@g.us'], deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  } as never);
+  statusCalls.length = 0;
+  sentCalls.length = 0;
+  await service.start(created.id);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const [target] = await db.select().from(campaignTargets).where(eq(campaignTargets.campaignId, created.id));
+  assert.equal(target.status, 'WAITING');
+  const delay = Date.parse(target.scheduledAt!) - Date.now();
+  assert.ok(delay >= 47 * 3_600_000 && delay <= 97 * 3_600_000);
+  assert.equal(sentCalls.length, 0);
+  await service.stop(created.id);
+});
+
+test('reconciliation cancels a failed target whose group is no longer live', async () => {
+  await insertGroup('failed-left@g.us', 'Failed left');
+  const captured = await service.captureManualSource({ text: 'Failed left', label: 'Failed left' });
+  const created = await service.create({
+    name: 'Failed left', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['failed-left@g.us'], deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  } as never);
+  await db.update(campaignTargets).set({ status: 'FAILED', errorMessage: 'delivery failed' })
+    .where(eq(campaignTargets.campaignId, created.id));
+  const reconcile = (service as unknown as {
+    reconcileAllGroupTargets: (id: string, live: string[]) => Promise<void>;
+  }).reconcileAllGroupTargets.bind(service);
+  await reconcile(created.id, ['some-other-group@g.us']);
+  const [target] = await db.select().from(campaignTargets).where(eq(campaignTargets.campaignId, created.id));
+  assert.equal(target.status, 'CANCELLED');
+});
+
+test('a recurring pass does not resurrect a cancelled target', async () => {
+  await insertGroup('rollover-a@g.us', 'Rollover A');
+  await insertGroup('rollover-b@g.us', 'Rollover B');
+  const captured = await service.captureManualSource({ text: 'Rollover status', label: 'Rollover status' });
+  const created = await service.create({
+    name: 'Rollover status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['rollover-a@g.us', 'rollover-b@g.us'],
+    deliveryMode: 'GROUP_STATUS', schedule: { type: 'DAILY', time: '17:00' },
+  } as never);
+  try {
+    await service.start(created.id);
+    await db.update(campaignTargets).set({ status: 'CANCELLED', errorMessage: 'The account is no longer a member of this group.' })
+      .where(and(eq(campaignTargets.campaignId, created.id), eq(campaignTargets.groupJid, 'rollover-a@g.us')));
+    await db.update(campaignTargets).set({ status: 'SENT', sentAt: new Date().toISOString() })
+      .where(and(eq(campaignTargets.campaignId, created.id), eq(campaignTargets.groupJid, 'rollover-b@g.us')));
+    // Clear nextRunAt and wake the worker so it performs the recurring rollover now.
+    await service.runNow(created.id);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const rows = await db.select({ jid: campaignTargets.groupJid, status: campaignTargets.status })
+      .from(campaignTargets).where(eq(campaignTargets.campaignId, created.id));
+    const byJid = new Map(rows.map((row) => [row.jid, row.status]));
+    assert.equal(byJid.get('rollover-a@g.us'), 'CANCELLED');
+    assert.equal(byJid.get('rollover-b@g.us'), 'QUEUED');
+  } finally {
+    await service.stop(created.id).catch(() => undefined);
+  }
 });

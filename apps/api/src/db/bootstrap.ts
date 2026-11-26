@@ -56,6 +56,12 @@ export async function bootstrapDatabase(): Promise<void> {
   if (!(await hasColumn('groups', 'joined_at'))) {
     await db.run(sql`ALTER TABLE groups ADD COLUMN joined_at text`);
   }
+  if (!(await hasColumn('groups', 'last_status_sent_at'))) {
+    await db.run(sql`ALTER TABLE groups ADD COLUMN last_status_sent_at text`);
+  }
+  if (!(await hasColumn('groups', 'community_parent_jid'))) {
+    await db.run(sql`ALTER TABLE groups ADD COLUMN community_parent_jid text`);
+  }
   await db.run(sql`CREATE TABLE IF NOT EXISTS discovered_links (id text PRIMARY KEY NOT NULL, account_id text NOT NULL REFERENCES whatsapp_accounts(id) ON DELETE CASCADE, invite_url text NOT NULL, invite_code text NOT NULL, source_group_jid text NOT NULL, source_group_name text NOT NULL, first_seen_at text NOT NULL, last_seen_at text NOT NULL, times_seen integer NOT NULL DEFAULT 1, source_message_id text, status text NOT NULL DEFAULT 'NEW', notes text, UNIQUE(account_id, invite_url))`);
   await db.run(sql`CREATE TABLE IF NOT EXISTS link_occurrences (id text PRIMARY KEY NOT NULL, link_id text NOT NULL REFERENCES discovered_links(id) ON DELETE CASCADE, source_group_jid text NOT NULL, occurred_at text NOT NULL)`);
   await db.run(sql`CREATE TABLE IF NOT EXISTS source_messages (id text PRIMARY KEY NOT NULL, account_id text NOT NULL REFERENCES whatsapp_accounts(id) ON DELETE CASCADE, chat_jid text NOT NULL, message_id text NOT NULL, payload text NOT NULL, preview text NOT NULL, created_at text NOT NULL, UNIQUE(account_id, chat_jid, message_id))`);
@@ -88,11 +94,32 @@ export async function bootstrapDatabase(): Promise<void> {
   if (!campaignColumns.some((column) => column.name === 'auto_resume_at')) {
     await db.run(sql`ALTER TABLE campaigns ADD COLUMN auto_resume_at text`);
   }
+  if (!campaignColumns.some((column) => column.name === 'distribution_id')) {
+    await db.run(sql`ALTER TABLE campaigns ADD COLUMN distribution_id text`);
+  }
+  if (!campaignColumns.some((column) => column.name === 'source_account_id')) {
+    await db.run(sql`ALTER TABLE campaigns ADD COLUMN source_account_id text`);
+  }
+  if (!campaignColumns.some((column) => column.name === 'delivery_mode')) {
+    await db.run(sql`ALTER TABLE campaigns ADD COLUMN delivery_mode text NOT NULL DEFAULT 'MESSAGE'`);
+  }
+  if (!campaignColumns.some((column) => column.name === 'target_all_groups')) {
+    await db.run(sql`ALTER TABLE campaigns ADD COLUMN target_all_groups integer NOT NULL DEFAULT false`);
+  }
+  await db.run(sql`CREATE INDEX IF NOT EXISTS campaigns_distribution ON campaigns (distribution_id)`);
   await db.run(sql`CREATE TABLE IF NOT EXISTS campaign_targets (id text PRIMARY KEY NOT NULL, campaign_id text NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE, group_jid text NOT NULL, group_name text NOT NULL, position integer NOT NULL, status text NOT NULL DEFAULT 'QUEUED', scheduled_at text, sent_at text, error_message text, attempt_count integer NOT NULL DEFAULT 0, UNIQUE(campaign_id, group_jid))`);
   await db.run(sql`CREATE TABLE IF NOT EXISTS campaign_sources (id text PRIMARY KEY NOT NULL, campaign_id text NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE, source_message_id text NOT NULL REFERENCES source_messages(id) ON DELETE CASCADE, position integer NOT NULL, created_at text NOT NULL, UNIQUE(campaign_id, source_message_id))`);
   await db.run(sql`CREATE TABLE IF NOT EXISTS operational_logs (id text PRIMARY KEY NOT NULL, level text NOT NULL, event text NOT NULL, details text, created_at text NOT NULL)`);
   await db.run(sql`CREATE TABLE IF NOT EXISTS action_log (id text PRIMARY KEY NOT NULL, account_id text NOT NULL REFERENCES whatsapp_accounts(id) ON DELETE CASCADE, action text NOT NULL, created_at text NOT NULL)`);
   await db.run(sql`CREATE INDEX IF NOT EXISTS action_log_account_action_created ON action_log (account_id, action, created_at)`);
+  await db.run(sql`CREATE TABLE IF NOT EXISTS join_queue (id text PRIMARY KEY NOT NULL, account_id text NOT NULL REFERENCES whatsapp_accounts(id) ON DELETE CASCADE, invite_url text NOT NULL, invite_code text NOT NULL, status text NOT NULL DEFAULT 'QUEUED', group_jid text, error_message text, position integer NOT NULL DEFAULT 0, created_at text NOT NULL, joined_at text, failed_at text, UNIQUE(account_id, invite_url))`);
+  // A build that mirrored groups across accounts marked its own queue rows
+  // auto_added. Automatic joining has been removed, so drop those still
+  // pending: only an operator-submitted link may join from here on.
+  const joinColumns = await db.all<{ name: string }>(sql`PRAGMA table_info(join_queue)`);
+  if (joinColumns.some((column) => column.name === 'auto_added')) {
+    await db.run(sql`DELETE FROM join_queue WHERE auto_added = 1 AND status = 'QUEUED'`);
+  }
   // Anti-restriction pacing is now built-in and non-configurable (see
   // safety/limits.ts): drop any per-account settings rows users saved earlier
   // so a stale edit can never be read back into behavior.

@@ -43,6 +43,8 @@ export const groups = sqliteTable('groups', {
   isScannerEnabled: integer('is_scanner_enabled', { mode: 'boolean' }).notNull().default(true),
   isExcluded: integer('is_excluded', { mode: 'boolean' }).notNull().default(false),
   lastCampaignSentAt: text('last_campaign_sent_at'),
+  lastStatusSentAt: text('last_status_sent_at'),
+  communityParentJid: text('community_parent_jid'),
   lastSyncedAt: text('last_synced_at'),
   joinedAt: text('joined_at'),
   ...timestamps,
@@ -95,6 +97,12 @@ export const campaigns = sqliteTable('campaigns', {
   autoAddJoinedGroups: integer('auto_add_joined_groups', { mode: 'boolean' }).notNull().default(false),
   shuffleOrder: integer('shuffle_order', { mode: 'boolean' }).notNull().default(true),
   pauseReason: text('pause_reason'),
+  // Campaigns split across accounts share one distribution id; the source
+  // messages stay owned by the account that captured them.
+  distributionId: text('distribution_id'),
+  sourceAccountId: text('source_account_id'),
+  deliveryMode: text('delivery_mode', { enum: ['MESSAGE', 'GROUP_STATUS'] }).notNull().default('MESSAGE'),
+  targetAllGroups: integer('target_all_groups', { mode: 'boolean' }).notNull().default(false),
   // When set, the campaign was auto-paused on the daily send budget and resumes
   // itself at this time (the next UTC midnight, when the budget refills).
   autoResumeAt: text('auto_resume_at'),
@@ -143,3 +151,17 @@ export const actionLog = sqliteTable('action_log', {
   action: text('action').notNull(),
   createdAt: text('created_at').notNull(),
 }, (table) => [index('action_log_account_action_created').on(table.accountId, table.action, table.createdAt)]);
+
+export const joinQueue = sqliteTable('join_queue', {
+  id: text('id').primaryKey(),
+  accountId: text('account_id').notNull().references(() => whatsappAccounts.id, { onDelete: 'cascade' }),
+  inviteUrl: text('invite_url').notNull(),
+  inviteCode: text('invite_code').notNull(),
+  status: text('status', { enum: ['QUEUED', 'JOINED', 'FAILED', 'CANCELLED'] }).notNull().default('QUEUED'),
+  groupJid: text('group_jid'),
+  errorMessage: text('error_message'),
+  position: integer('position').notNull().default(0),
+  createdAt: text('created_at').notNull(),
+  joinedAt: text('joined_at'),
+  failedAt: text('failed_at'),
+}, (table) => [uniqueIndex('join_queue_account_url').on(table.accountId, table.inviteUrl)]);

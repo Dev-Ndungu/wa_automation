@@ -12,18 +12,30 @@ import { actionLog } from '../db/schema.js';
  * never to tune how fast things happen.
  */
 
-/** Random wait between consecutive group joins. */
-export const JOIN_PACING = { minSeconds: 120, maxSeconds: 300 };
+/**
+ * Random wait between consecutive group joins, drawn per join. Joining is the
+ * single most restriction-sensitive action: a rapid run of joins is the classic
+ * way an account gets restricted, so the gap is measured in hours, not minutes.
+ */
+export const JOIN_PACING = { minSeconds: 7_200, maxSeconds: 14_400 };
 
-/** Hard caps on joins: a burst window and a per-day total. */
-export const JOIN_BURST = { limit: 2, windowMinutes: 180 };
-export const JOIN_DAILY_LIMIT = 3;
+/**
+ * Hard caps on joins: a burst window and a per-day total. The burst window is
+ * wider than the pacing floor, so at most one join lands in any five-hour span
+ * even if an operator submits several at once; the per-day total is the overall
+ * ceiling.
+ */
+export const JOIN_BURST = { limit: 1, windowMinutes: 300 };
+export const JOIN_DAILY_LIMIT = 5;
 
 /** Random wait between consecutive message sends, drawn per message. */
 export const SEND_GAP = { minSeconds: 60, maxSeconds: 240 };
 
 /** Random cooldown after a group received a campaign, drawn once per parking. */
 export const GROUP_COOLDOWN = { minHours: 18, maxHours: 48 };
+
+/** Random cooldown after a group received a status, drawn once per parking. */
+export const STATUS_GROUP_COOLDOWN = { minHours: 48, maxHours: 96 };
 
 /** Random grace for a freshly joined group before its first campaign send. */
 export const NEW_GROUP_GRACE = { minMinutes: 120, maxMinutes: 360 };
@@ -32,11 +44,11 @@ export const NEW_GROUP_GRACE = { minMinutes: 120, maxMinutes: 360 };
 export const CAMPAIGN_WARMUP = { minSeconds: 30, maxSeconds: 120 };
 
 /**
- * Hard cap on campaign sends per account per UTC day. Kept deliberately
- * conservative: sending to many groups every day is the classic restriction
- * trigger, and a fresh number has no reputation to spend.
+ * Hard cap on campaign sends per account per UTC day. Raised to the observed
+ * safe ceiling for this account: sending to many groups every day is still the
+ * classic restriction trigger, so this is never tuned by hand at runtime.
  */
-export const SEND_DAILY_LIMIT = 200;
+export const SEND_DAILY_LIMIT = 300;
 
 /**
  * Milliseconds until the daily send budget refills. The budget counts SEND rows
@@ -69,6 +81,12 @@ export function millisecondsUntilSendWindowOpens(at = new Date()): number {
   const nextOpenMs = currentMs < opensMs ? opensMs : 24 * 60 * 60 * 1_000 + opensMs;
   return nextOpenMs - currentMs;
 }
+
+/** Joins share the same East Africa daytime window as sends. */
+export const JOIN_WINDOW = SEND_WINDOW;
+
+/** Milliseconds until the next daytime opening for joins, or 0 while open. */
+export const millisecondsUntilJoinWindowOpens = millisecondsUntilSendWindowOpens;
 
 /**
  * Reconnect ladder after a connection closes: each consecutive close draws a
@@ -128,6 +146,12 @@ export function drawCampaignWarmupSeconds(rng: () => number = Math.random): numb
 /** Uniform group cooldown in milliseconds, from GROUP_COOLDOWN hours. */
 export function drawGroupCooldownMs(rng: () => number = Math.random): number {
   const hours = GROUP_COOLDOWN.minHours + rng() * (GROUP_COOLDOWN.maxHours - GROUP_COOLDOWN.minHours);
+  return Math.floor(hours * 3_600_000);
+}
+
+/** Uniform status cooldown in milliseconds, from STATUS_GROUP_COOLDOWN hours. */
+export function drawStatusGroupCooldownMs(rng: () => number = Math.random): number {
+  const hours = STATUS_GROUP_COOLDOWN.minHours + rng() * (STATUS_GROUP_COOLDOWN.maxHours - STATUS_GROUP_COOLDOWN.minHours);
   return Math.floor(hours * 3_600_000);
 }
 

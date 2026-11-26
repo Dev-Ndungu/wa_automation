@@ -1,16 +1,17 @@
 # WhatsApp Group Control
 
-A self-hosted, privacy-conscious administration dashboard for a WhatsApp account that you legitimately control. The system discovers WhatsApp group invite links posted in groups, lets an administrator explicitly confirm joining one selected invite at a time, and forwards a specifically selected existing message to an explicit group allowlist. It does not automatically join groups, message individuals, collect group members, or use evasion features.
+A self-hosted, privacy-conscious administration dashboard for a WhatsApp account that you legitimately control. The system discovers WhatsApp group invite links posted in groups, lets an administrator explicitly confirm joining one selected invite at a time, and forwards a specifically selected existing message to an explicit group allowlist. Campaigns whose target groups are shared by several linked accounts are split across those accounts, but only accounts that are already members receive a share. It never joins groups automatically, messages individuals, collects group members, or uses evasion features.
 
 > Baileys is an unofficial WhatsApp Web library and is not affiliated with, endorsed by, or supported by WhatsApp. Ensure your use complies with WhatsApp's terms and with applicable law.
 
 ## Current status
 
 The dashboard, SQLite/Drizzle data layer, multi-account management, WhatsApp
-QR linking with local session backup/restore, group synchronization, invite-link
-scanning, manual group joining, and the persistent campaign sender are all
-implemented and run locally. Pacing and safety caps are built in and cannot be
-configured away (see "Account safety" below).
+QR linking with local session backup/restore, group synchronization,
+invite-link scanning, manual group joining, multi-account campaign splitting,
+and the persistent campaign sender are all implemented and run locally. Pacing
+and safety caps are built in and cannot be configured away (see "Account
+safety" below).
 
 ## Account safety
 
@@ -21,17 +22,29 @@ following fixed, non-configurable precautions:
   a custom client identity.
 - Presence is never marked online, and full chat history is never synced.
 - Sends are paced with random gaps (60s–4min), random campaign warm-up, a quiet
-  window after every reconnect, and a hard cap of 200 messages per account per
+  window after every reconnect, and a hard cap of 300 messages per account per
   day. Reaching the cap pauses the campaign for the rest of the day; it resumes
   itself once the cap resets at UTC midnight and the 06:00 EAT send window is
   open again, so no operator action is needed for a new day.
-- Group joins are limited to 2 per 3 hours and 3 per day, and only ever happen
-  when an administrator presses Join on a saved link. The scanner never joins
-  groups automatically.
+- Group joins only ever happen when an administrator presses Join on a saved
+  link or submits a list to the join queue. Nothing joins a group on its own.
+  Joins are capped at 1 per 5 hours and 5 per account per day, 2–4 hours
+  apart, during the 06:00–23:00 EAT window. Automatically joining groups from
+  discovered links is deliberately not implemented.
+- A campaign is split across linked accounts only when those accounts are
+  already members of the target groups; nothing is joined to prepare a
+  campaign. Each account keeps its own daily send cap, and the campaign card in
+  the dashboard shows combined progress.
 - Every group gets a random 18–48h cooldown, and freshly joined groups get a
   120–360 minute grace period before their first campaign message.
 - Failed connection attempts back off on a widening ladder and stop entirely;
   a refused (403) session never reconnects automatically.
+
+A new account can only join a group when a saved invite link for it exists.
+Discovered links are kept, so an operator can join from the Links page at any
+time. WhatsApp only lets group admins retrieve an invite link, so for groups
+where no account has that permission, paste a fresh link under Links → Add
+invite links; it is then available to join from that page.
 
 These measures reduce, but cannot eliminate, restriction risk. A new or
 previously restricted number should be used normally on the phone for a while

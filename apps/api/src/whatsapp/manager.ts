@@ -1,9 +1,12 @@
-import makeWASocket, { Browsers, DisconnectReason, fetchLatestWaWebVersion, useMultiFileAuthState } from '@whiskeysockets/baileys';
-import type { ConnectionState, GroupMetadata, WASocket } from '@whiskeysockets/baileys';
+import makeWASocket, { Browsers, DisconnectReason, fetchLatestWaWebVersion, generateMessageID, useMultiFileAuthState } from '@whiskeysockets/baileys';
+import type { BinaryNode, ConnectionState, GroupMetadata, proto, WASocket } from '@whiskeysockets/baileys';
+import { buildGroupStatusInner, createGroupStatusWrapper, GROUP_STATUS_META } from './group-status.js';
+import type { GroupStatusContent, GroupStatusSecretMode } from './group-status.js';
+import { buildStatusAck } from './status-ack.js';
 import type { FastifyBaseLogger } from 'fastify';
 import QRCode from 'qrcode';
 import { existsSync, readFileSync } from 'node:fs';
-import { cp, mkdir, rm } from 'node:fs/promises';
+import { copyFile, cp, mkdir, readdir, rename, rm, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { and, eq } from 'drizzle-orm';
@@ -33,6 +36,11 @@ const whatsappWebVersion: [number, number, number] = [2, 3000, 1043857760];
 const whatsappBrowser = Browsers.macOS('Safari');
 
 export class WhatsAppManager {
+  private static readonly AUTH_MIRROR_INTERVAL_MS = 5 * 60_000;
+
+  private readonly groupStatusWrapper = createGroupStatusWrapper();
+  // Message ID -> wrapped envelope, for rc14's getMessage retry fallback.
+  private readonly statusRetryMessages = new Map<string, proto.IMessage>();
   private socket: WASocket | null = null;
   private connectPromise: Promise<void> | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
@@ -64,7 +72,11 @@ export class WhatsAppManager {
   // Reading it (in addition to the per-account folder) keeps sessions
   // recoverable after an upgrade without forcing a new QR pairing.
   private readonly legacyAuthBackupDir: string | null;
-  private authSnapshotPromise: Promise<void> = Promise.resolve();
+  private authMirrorTimer: NodeJS.Timeout | null = null;
+  private authMirrorPromise: Promise<void> = Promise.resolve();
+  // Credential file names discovered once: re-listing the live auth folder on
+  // every credentials update would scan hundreds of thousands of key files.
+  private authCredentialFileNames: string[] | null = null;
   // Serializes manual join attempts so pacing limits always hold across them.
   private joinQueue: Promise<void> = Promise.resolve();
 
@@ -184,8 +196,21 @@ export class WhatsAppManager {
         syncFullHistory: false,
         logger: this.logger as never,
         generateHighQualityLinkPreview: false,
+        // Keep rc14's retry cache for ordinary campaign messages. For status
+        // messages we overwrite the cached entry with the wrapped envelope after
+        // relay; rc14's retry branch bypasses patchMessageBeforeSending and
+        // cannot attach the plaintext meta node (known limitation).
+        enableRecentMessageCache: true,
+        getMessage: async (key) => this.statusRetryMessage(key),
+        patchMessageBeforeSending: async (message) => this.groupStatusWrapper.patch(message),
       });
       this.socket = socket;
+      // rc14 registers no CB:status handler. Without an ack the server can
+      // close the stream after ~50 minutes of group-status traffic, so
+      // acknowledge top-level status stanzas as they arrive.
+      (socket.ws as unknown as { on(event: string, listener: (node: BinaryNode) => void): void }).on('CB:status', (node) => {
+        void this.ackStatusStanza(socket, node);
+      });
       socket.ev.on('creds.update', () => {
         void saveCreds().then(() => this.queueAuthSnapshot()).catch((error: unknown) => {
           this.logger.error({ err: error }, 'Unable to save WhatsApp credentials');
@@ -324,11 +349,71 @@ export class WhatsAppManager {
   }
 
   public async syncGroups(): Promise<number> {
+    const jids = await this.participatingGroupJids();
+    this.logger.info({ groups: jids.length }, 'WhatsApp group sync completed');
+    return jids.length;
+  }
+
+  /**
+   * Live group JIDs the account participates in. Also refreshes the local group
+   * cache so targetAllGroups reconciliation sees names and exclusions.
+   */
+  public async participatingGroupJids(): Promise<string[]> {
     if (!this.socket || this.status.state !== 'CONNECTED') throw new Error('WhatsApp is not connected.');
     const available = await this.socket.groupFetchAllParticipating();
     await this.upsertGroups(Object.values(available));
-    this.logger.info({ groups: Object.keys(available).length }, 'WhatsApp group sync completed');
-    return Object.keys(available).length;
+    return Object.keys(available);
+  }
+
+  /** Post a 24-hour status visible only to the members of one group. */
+  public async sendGroupStatus(
+    groupJid: string,
+    content: GroupStatusContent,
+    options: { messageSecret?: GroupStatusSecretMode } = {},
+  ): Promise<void> {
+    if (!groupJid.endsWith('@g.us')) throw new Error('Group statuses can only be posted to a group.');
+    if (!this.socket || this.status.state !== 'CONNECTED') throw new Error('WhatsApp is not connected.');
+    const inner = await buildGroupStatusInner(content, { upload: this.socket.waUploadToServer, logger: this.logger });
+    this.groupStatusWrapper.mark(inner, options.messageSecret);
+    const messageId = generateMessageID();
+    // Cache the wrapped envelope before relaying: rc14's retry branch skips
+    // the patch and asks getMessage for the original message. The wrapper is
+    // recovered here; the plaintext meta node cannot be attached on retries.
+    const envelope = this.groupStatusWrapper.patch(inner);
+    this.statusRetryMessages.set(messageId, envelope);
+    if (this.statusRetryMessages.size > 2000) {
+      const oldest = this.statusRetryMessages.keys().next().value;
+      if (oldest) this.statusRetryMessages.delete(oldest);
+    }
+    // Relay the inner message, never a pre-built wrapper: getMediaType must see
+    // the top-level image/video so the <enc mediatype> attribute is set before
+    // the patch wraps it into groupStatusMessageV2.
+    await this.socket.relayMessage(groupJid, inner, {
+      messageId,
+      additionalNodes: [GROUP_STATUS_META],
+    });
+    // rc14 caches the raw inner message during relay. Replace that entry with
+    // the wrapped envelope so a retry resends a status-shaped payload; the
+    // plaintext meta node still cannot be attached on retries.
+    const retryManager = (this.socket as unknown as {
+      messageRetryManager?: { addRecentMessage: (to: string, id: string, message: proto.IMessage) => void };
+    }).messageRetryManager;
+    retryManager?.addRecentMessage(groupJid, messageId, envelope);
+  }
+
+  /** rc14 retry fallback: return the wrapped envelope for a status message ID. */
+  private async statusRetryMessage(key: proto.IMessageKey): Promise<proto.IMessage | undefined> {
+    return key.id ? this.statusRetryMessages.get(key.id) : undefined;
+  }
+
+  private async ackStatusStanza(socket: WASocket, node: BinaryNode): Promise<void> {
+    try {
+      const sendNode = (socket as unknown as { sendNode?: (node: BinaryNode) => Promise<void> }).sendNode;
+      if (!sendNode) return;
+      await sendNode(buildStatusAck(node));
+    } catch (error) {
+      this.logger.warn({ err: error }, 'Unable to acknowledge a WhatsApp status stanza');
+    }
   }
 
   /**
@@ -336,21 +421,28 @@ export class WhatsAppManager {
    * Name and description are only overwritten when WhatsApp provides them, so
    * a partial event (for example groups.update) can never blank a known name.
    */
-  private async upsertGroups(metadata: Array<{ id: string; subject?: string; desc?: string }>): Promise<void> {
+  private async upsertGroups(metadata: Array<{ id: string; subject?: string; desc?: string; linkedParent?: string }>): Promise<void> {
+    if (metadata.length === 0) return;
     const syncedAt = now();
-    for (const group of metadata) {
-      await db.insert(groups).values({
-        id: randomUUID(), accountId: this.accountId, whatsappGroupJid: group.id, name: group.subject || group.id, description: group.desc ?? null,
-        isTarget: false, isScannerEnabled: true, isExcluded: false, lastSyncedAt: syncedAt, createdAt: syncedAt, updatedAt: syncedAt,
-      }).onConflictDoUpdate({
-        target: [groups.accountId, groups.whatsappGroupJid],
-        set: {
-          ...(group.subject !== undefined ? { name: group.subject } : {}),
-          ...(group.desc !== undefined ? { description: group.desc } : {}),
-          lastSyncedAt: syncedAt, updatedAt: syncedAt,
-        },
-      });
-    }
+    // One transaction for the whole sync: a few hundred autocommitted upserts
+    // made group refreshes (and every "Edit campaign") wait on the disk.
+    await db.transaction(async (tx) => {
+      for (const group of metadata) {
+        await tx.insert(groups).values({
+          id: randomUUID(), accountId: this.accountId, whatsappGroupJid: group.id, name: group.subject || group.id, description: group.desc ?? null,
+          communityParentJid: group.linkedParent ?? null,
+          isTarget: false, isScannerEnabled: true, isExcluded: false, lastSyncedAt: syncedAt, createdAt: syncedAt, updatedAt: syncedAt,
+        }).onConflictDoUpdate({
+          target: [groups.accountId, groups.whatsappGroupJid],
+          set: {
+            ...(group.subject !== undefined ? { name: group.subject } : {}),
+            ...(group.desc !== undefined ? { description: group.desc } : {}),
+            ...(group.linkedParent !== undefined ? { communityParentJid: group.linkedParent } : {}),
+            lastSyncedAt: syncedAt, updatedAt: syncedAt,
+          },
+        });
+      }
+    });
   }
 
   public async joinGroup(inviteCode: string): Promise<string> {
@@ -425,8 +517,10 @@ export class WhatsAppManager {
     if (clearRejectedSession) {
       await rm(this.authDir, { recursive: true, force: true });
       await rm(this.authBackupDir, { recursive: true, force: true });
+      this.authCredentialFileNames = null;
     } else if (skipRestore && this.hasSavedSession()) {
       await rm(this.authDir, { recursive: true, force: true });
+      this.authCredentialFileNames = null;
     }
     await this.start();
   }
@@ -444,17 +538,90 @@ export class WhatsAppManager {
     }
   }
 
-  private queueAuthSnapshot(): Promise<void> {
-    this.authSnapshotPromise = this.authSnapshotPromise
+  /**
+   * Backups used to be a full `cp` of the live auth folder on every credentials
+   * update. Baileys stores one file per signal key, so that folder can hold
+   * hundreds of thousands of tiny files; repeatedly copying it saturated the
+   * disk and froze unrelated API requests for tens of seconds. The credentials
+   * that define a recoverable session are copied immediately (a handful of
+   * small files), while the key store is mirrored incrementally and at most
+   * once per AUTH_MIRROR_INTERVAL_MS.
+   */
+  private queueAuthSnapshot(): void {
+    void this.snapshotAuthCredentials();
+    if (this.authMirrorTimer) return;
+    this.authMirrorTimer = setTimeout(() => {
+      this.authMirrorTimer = null;
+      void this.mirrorAuthStore();
+    }, WhatsAppManager.AUTH_MIRROR_INTERVAL_MS);
+    // A pending backup must never hold the process open at shutdown.
+    this.authMirrorTimer.unref();
+  }
+
+  /** Copy only the small files that make a session recoverable. */
+  private async snapshotAuthCredentials(): Promise<void> {
+    try {
+      if (!this.hasSavedSession()) return;
+      await mkdir(this.authBackupDir, { recursive: true });
+      this.authCredentialFileNames ??= (await readdir(this.authDir))
+        .filter((name) => name === 'creds.json' || name.startsWith('app-state-sync'));
+      await Promise.all(this.authCredentialFileNames.map(async (name) => {
+        try {
+          await this.copyAuthFile(resolve(this.authDir, name), resolve(this.authBackupDir, name));
+        } catch (error) {
+          // A rotated app-state file can be absent; the next mirror picks it up.
+          this.logger.warn({ err: error, name }, 'Unable to copy a WhatsApp credential file');
+        }
+      }));
+    } catch (error) {
+      this.logger.error({ err: error }, 'Unable to back up WhatsApp credentials');
+    }
+  }
+
+  /** Incremental mirror: copy only files that changed and remove copies of
+   *  keys the live store no longer has. */
+  private mirrorAuthStore(): Promise<void> {
+    this.authMirrorPromise = this.authMirrorPromise
       .then(async () => {
         if (!this.hasSavedSession()) return;
-        await rm(this.authBackupDir, { recursive: true, force: true });
-        await cp(this.authDir, this.authBackupDir, { recursive: true, force: true });
+        await mkdir(this.authBackupDir, { recursive: true });
+        const liveNames = await readdir(this.authDir);
+        const live = new Set(liveNames);
+        for (const name of liveNames) {
+          const source = resolve(this.authDir, name);
+          const target = resolve(this.authBackupDir, name);
+          const sourceInfo = await stat(source).catch(() => null);
+          if (!sourceInfo?.isFile()) continue;
+          const targetInfo = await stat(target).catch(() => null);
+          // copyFile does not preserve mtimes, so a target at least as new as
+          // its source already holds the latest contents.
+          if (targetInfo && targetInfo.size === sourceInfo.size && targetInfo.mtimeMs >= sourceInfo.mtimeMs) continue;
+          await this.copyAuthFile(source, target);
+        }
+        for (const name of await readdir(this.authBackupDir)) {
+          // A temporary file belongs to an in-flight atomic copy; the next
+          // mirror removes it if that copy does not land.
+          if (!live.has(name) && !name.endsWith('.tmp')) await rm(resolve(this.authBackupDir, name), { force: true });
+        }
+        this.logger.info({ files: live.size }, 'WhatsApp auth store mirrored to local backup');
       })
       .catch((error: unknown) => {
         this.logger.error({ err: error }, 'Unable to back up WhatsApp credentials');
       });
-    return this.authSnapshotPromise;
+    return this.authMirrorPromise;
+  }
+
+  /** Write through a temporary file so a crash mid-copy cannot leave a partial
+   *  credentials or key file in the recovery folder. */
+  private async copyAuthFile(source: string, target: string): Promise<void> {
+    const temporary = `${target}.${randomUUID()}.tmp`;
+    try {
+      await copyFile(source, temporary);
+      await rename(temporary, target);
+    } catch (error) {
+      await rm(temporary, { force: true });
+      throw error;
+    }
   }
 
   private async getCompatibleWebVersion(): Promise<[number, number, number]> {

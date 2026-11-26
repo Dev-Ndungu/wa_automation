@@ -6,7 +6,10 @@ import sharp from 'sharp';
 import { db } from '../db/client.js';
 import { campaignSources, campaignTargets, campaigns, groups, operationalLogs, sourceMessages } from '../db/schema.js';
 import type { WhatsAppManager, WhatsAppStatus } from '../whatsapp/manager.js';
-import { CIRCUIT_BREAKER_CONSECUTIVE_FAILURES, drawCampaignWarmupSeconds, drawGroupCooldownMs, drawGroupGraceMs, drawReconnectSettleSeconds, drawSendGapSeconds, GROUP_COOLDOWN, millisecondsUntilDailyBudgetResets, millisecondsUntilSendWindowOpens, recordSend, SEND_DAILY_LIMIT, SEND_GAP, sendsToday } from '../safety/limits.js';
+import { GROUP_STATUS_VIDEO_SUPPORTED } from '../whatsapp/group-status.js';
+import type { WASocket } from '@whiskeysockets/baileys';
+import type { GroupStatusContent } from '../whatsapp/group-status.js';
+import { CIRCUIT_BREAKER_CONSECUTIVE_FAILURES, drawCampaignWarmupSeconds, drawGroupCooldownMs, drawGroupGraceMs, drawReconnectSettleSeconds, drawSendGapSeconds, drawStatusGroupCooldownMs, GROUP_COOLDOWN, millisecondsUntilDailyBudgetResets, millisecondsUntilSendWindowOpens, recordSend, SEND_DAILY_LIMIT, SEND_GAP, sendsToday, STATUS_GROUP_COOLDOWN } from '../safety/limits.js';
 import { canDeliverTarget, cooldownWarnings, type CampaignSchedule, validateExplicitTargets, validateSchedule } from './policy.js';
 
 const now = () => new Date().toISOString();
@@ -42,6 +45,11 @@ export type CampaignPacing = {
    * so a suite is not blocked by the hour it happens to run at.
    */
   sendWindowDelayMs: () => number;
+  /**
+   * How often a targetAllGroups status campaign reconciles its target list
+   * against live group membership. Tests inject 0 so every pass reconciles.
+   */
+  statusReconcileIntervalMs?: number;
 };
 
 export const DEFAULT_PACING: CampaignPacing = {
@@ -55,6 +63,7 @@ export const DEFAULT_PACING: CampaignPacing = {
   // until 06:00 EAT.
   dailyBudgetResetMs: () => Math.max(millisecondsUntilDailyBudgetResets(), millisecondsUntilSendWindowOpens()),
   sendWindowDelayMs: () => millisecondsUntilSendWindowOpens(),
+  statusReconcileIntervalMs: 10 * 60_000,
 };
 
 type CampaignStatus = 'DRAFT' | 'QUEUED' | 'RUNNING' | 'PAUSED' | 'COMPLETED' | 'STOPPED' | 'FAILED';
@@ -64,7 +73,24 @@ export type ManualSourceInput = {
   files?: unknown; // Array<{ kind: 'image'|'video'; dataUrl: unknown; caption?: unknown; name?: unknown }>
   updateSourceIds?: unknown; // keep existing sources, only refresh their caption/text
 };
-export type CampaignInput = { name: unknown; sourceMessageId: unknown; sourceMessageIds?: unknown; groupJids: unknown; schedule?: unknown; dailyRunTime?: unknown; autoAddJoinedGroups?: unknown; shuffleOrder?: unknown };
+export type CampaignInput = { name: unknown; sourceMessageId: unknown; sourceMessageIds?: unknown; groupJids: unknown; schedule?: unknown; dailyRunTime?: unknown; autoAddJoinedGroups?: unknown; shuffleOrder?: unknown; deliveryMode?: unknown; targetAllGroups?: unknown };
+
+/** Everything validated from a CampaignInput except the per-account target subset. */
+export type CampaignPlan = {
+  name: string;
+  sourceIds: string[];
+  groupJids: string[];
+  schedule: CampaignSchedule;
+  autoAddJoinedGroups: boolean;
+  shuffleOrder: boolean;
+  deliveryMode: 'MESSAGE' | 'GROUP_STATUS';
+  targetAllGroups: boolean;
+};
+
+export type CampaignShardOptions = {
+  distributionId?: string | null;
+  sourceAccountId?: string | null;
+};
 
 export type CapturedSource = { id: string; kind: 'text' | 'image' | 'video'; preview: string };
 
@@ -86,6 +112,21 @@ function autoAddJoinedGroupsFrom(value: unknown): boolean {
 function shuffleOrderFrom(value: unknown): boolean {
   if (value === undefined) return true;
   if (typeof value !== 'boolean') throw new Error('Shuffle recipient order must be true or false.');
+  return value;
+}
+
+function deliveryModeFrom(value: unknown): 'MESSAGE' | 'GROUP_STATUS' {
+  if (value === undefined) return 'MESSAGE';
+  if (value === 'MESSAGE' || value === 'GROUP_STATUS') return value;
+  throw new Error('deliveryMode must be MESSAGE or GROUP_STATUS.');
+}
+
+function targetAllGroupsFrom(value: unknown, deliveryMode: 'MESSAGE' | 'GROUP_STATUS'): boolean {
+  if (value === undefined) return false;
+  if (typeof value !== 'boolean') throw new Error('targetAllGroups must be true or false.');
+  if (value && deliveryMode !== 'GROUP_STATUS') {
+    throw new Error('targetAllGroups is only available for group-status campaigns.');
+  }
   return value;
 }
 
@@ -123,6 +164,17 @@ function sourceKindFromPayload(payload: string): 'text' | 'image' | 'video' {
     if (typeof parsed.imageDataUrl === 'string') return 'image';
     if (typeof parsed.videoDataUrl === 'string') return 'video';
   } catch { /* A broken payload is treated as plain text for display purposes. */ }
+  return 'text';
+}
+
+/**
+ * Detect a source kind from a payload prefix. Summaries (the campaign list is
+ * polled every few seconds) must not load the full payload: media payloads
+ * carry megabytes of base64 after these keys.
+ */
+function sourceKindFromPrefix(prefix: string): 'text' | 'image' | 'video' {
+  if (/"kind"\s*:\s*"video"/.test(prefix) || /"videoDataUrl"\s*:/.test(prefix)) return 'video';
+  if (/"kind"\s*:\s*"image"/.test(prefix) || /"imageDataUrl"\s*:/.test(prefix)) return 'image';
   return 'text';
 }
 
@@ -164,6 +216,8 @@ export class CampaignService {
   // sends holds across concurrent campaigns, not just inside one campaign.
   private accountSendQueue: Promise<void> = Promise.resolve();
   private lastSendAtMs = 0;
+  // Last successful targetAllGroups reconciliation per campaign, in ms.
+  private lastAllGroupReconcile = new Map<string, number>();
   // After the connection returns, sends stay gated until this wall-clock time.
   // Drawn once per reconnect (see the constructor subscription) so the account
   // sits quiet on the server side while the freshly resumed session settles.
@@ -332,11 +386,11 @@ export class CampaignService {
   /** Resolve the ordered source-message list for a campaign input. The new
    *  multi-file field wins when both are present; the legacy single ID is the
    *  fallback. Every referenced message must exist for this account. */
-  private async resolveSourceMessageIds(sourceMessageIds: unknown, sourceMessageId: unknown): Promise<string[]> {
-    if (sourceMessageIds !== undefined) return this.resolveSourceMessageIdList(sourceMessageIds, 'sourceMessageIds');
+  private async resolveSourceMessageIds(sourceMessageIds: unknown, sourceMessageId: unknown, sourceAccountId = this.accountId): Promise<string[]> {
+    if (sourceMessageIds !== undefined) return this.resolveSourceMessageIdList(sourceMessageIds, 'sourceMessageIds', sourceAccountId);
     if (sourceMessageId === undefined) throw new Error('A campaign needs at least one source message.');
     const single = validText(sourceMessageId, 'sourceMessageId', 128);
-    await this.assertSourceMessagesExist([single]);
+    await this.assertSourceMessagesExist([single], sourceAccountId);
     return [single];
   }
 
@@ -344,7 +398,7 @@ export class CampaignService {
    *  at most 10 non-empty trimmed strings, no duplicates, and every message
    *  existing for this account. Shared by the campaign input and the manual
    *  capture update path, each with its own field name in error messages. */
-  private async resolveSourceMessageIdList(value: unknown, field: string): Promise<string[]> {
+  private async resolveSourceMessageIdList(value: unknown, field: string, sourceAccountId = this.accountId): Promise<string[]> {
     if (!Array.isArray(value)) throw new Error(`${field} must be an array of source message IDs.`);
     const ids = value as unknown[];
     if (ids.length === 0) throw new Error('A campaign needs at least one source message.');
@@ -357,15 +411,38 @@ export class CampaignService {
       trimmed.push(entry.trim());
     }
     if (new Set(trimmed).size !== trimmed.length) throw new Error('Each source message can be selected only once.');
-    await this.assertSourceMessagesExist(trimmed);
+    await this.assertSourceMessagesExist(trimmed, sourceAccountId);
     return trimmed;
   }
 
-  private async assertSourceMessagesExist(ids: string[]): Promise<void> {
+  private async assertSourceMessagesExist(ids: string[], sourceAccountId = this.accountId): Promise<void> {
     const found = await db.select({ id: sourceMessages.id }).from(sourceMessages)
-      .where(and(eq(sourceMessages.accountId, this.accountId), inArray(sourceMessages.id, ids)));
+      .where(and(eq(sourceMessages.accountId, sourceAccountId), inArray(sourceMessages.id, ids)));
     const known = new Set(found.map((row) => row.id));
     if (ids.some((id) => !known.has(id))) throw new Error('The selected manual source message was not found.');
+  }
+
+  /** Every non-excluded group on this account, for a targetAllGroups plan. */
+  private async allNonExcludedGroupJids(): Promise<string[]> {
+    const rows = await db.select({ jid: groups.whatsappGroupJid }).from(groups)
+      .where(and(eq(groups.accountId, this.accountId), eq(groups.isExcluded, false)));
+    if (rows.length === 0) throw new Error('No groups are available on this account.');
+    return rows.map((row) => row.jid);
+  }
+
+  /** A group status is one text or caption of at most 1,024 characters; video is gated by the spike. */
+  private async assertStatusSources(ids: string[], sourceAccountId: string): Promise<void> {
+    const rows = await db.select({ payload: sourceMessages.payload }).from(sourceMessages)
+      .where(and(eq(sourceMessages.accountId, sourceAccountId), inArray(sourceMessages.id, ids)));
+    if (rows.length !== ids.length) throw new Error('The selected manual source message was not found.');
+    for (const row of rows) {
+      const content = JSON.parse(row.payload) as { text?: unknown; caption?: unknown; videoDataUrl?: unknown };
+      const text = typeof content.text === 'string' ? content.text : typeof content.caption === 'string' ? content.caption : '';
+      if (text.length > 1024) throw new Error('A group status can contain at most 1024 characters.');
+      if (typeof content.videoDataUrl === 'string' && !GROUP_STATUS_VIDEO_SUPPORTED) {
+        throw new Error('Group-status video is not supported yet; use text or an image.');
+      }
+    }
   }
 
   /** Replace the campaign's ordered source list only when it actually changed.
@@ -384,28 +461,53 @@ export class CampaignService {
     }
   }
 
-  public async create(input: CampaignInput) {
+  /**
+   * Validate a campaign input once. The source messages are checked against
+   * the account that captured them, which may differ from the account that
+   * sends a distributed shard.
+   */
+  public async plan(input: CampaignInput, sourceAccountId = this.accountId): Promise<CampaignPlan> {
     const name = validText(input.name, 'name', 120);
-    const sourceIds = await this.resolveSourceMessageIds(input.sourceMessageIds, input.sourceMessageId);
-    const groupJids = validateExplicitTargets(input.groupJids);
+    const deliveryMode = deliveryModeFrom(input.deliveryMode);
+    const targetAllGroups = targetAllGroupsFrom(input.targetAllGroups, deliveryMode);
+    const sourceIds = await this.resolveSourceMessageIds(input.sourceMessageIds, input.sourceMessageId, sourceAccountId);
+    const groupJids = targetAllGroups ? await this.allNonExcludedGroupJids() : validateExplicitTargets(input.groupJids);
     const autoAddJoinedGroups = autoAddJoinedGroupsFrom(input.autoAddJoinedGroups);
     const shuffleOrder = shuffleOrderFrom(input.shuffleOrder);
+    if (deliveryMode === 'GROUP_STATUS') await this.assertStatusSources(sourceIds, sourceAccountId);
     const schedule = input.schedule === undefined && input.dailyRunTime ? validateSchedule({ type: 'DAILY', time: input.dailyRunTime }) : validateSchedule(input.schedule);
+    return { name, sourceIds, groupJids, schedule, autoAddJoinedGroups, shuffleOrder, deliveryMode, targetAllGroups };
+  }
 
+  private async selectTargets(groupJids: string[]) {
     const selectedGroups = await db.select({ jid: groups.whatsappGroupJid, name: groups.name, lastCampaignSentAt: groups.lastCampaignSentAt, isExcluded: groups.isExcluded })
       .from(groups).where(and(eq(groups.accountId, this.accountId), inArray(groups.whatsappGroupJid, groupJids)));
     const byJid = new Map(selectedGroups.map((group) => [group.jid, group]));
     const missing = groupJids.filter((jid) => !byJid.has(jid));
     if (missing.length) throw new Error('Every target must be a group synced from the linked WhatsApp account.');
     if (selectedGroups.some((group) => group.isExcluded)) throw new Error('Excluded groups cannot be included in a campaign. Remove the exclusion first if you want to use one.');
+    return { selectedGroups, byJid };
+  }
 
+  /** Insert one campaign row (a shard, when distributed) for a target subset. */
+  public async createFromPlan(plan: CampaignPlan, groupJids: string[], options: CampaignShardOptions = {}) {
+    const { selectedGroups, byJid } = await this.selectTargets(groupJids);
+    const sourceAccountId = options.sourceAccountId ?? this.accountId;
+    const distributionId = options.distributionId ?? null;
     const id = randomUUID();
     const createdAt = now();
     // The interval_seconds columns are legacy and inert: pacing is randomized
     // and built in (see safety/limits.ts). They stay because the columns are
     // NOT NULL without a default in the original bootstrap schema.
-    await db.insert(campaigns).values({ id, accountId: this.accountId, name, sourceMessageReference: sourceIds[0], status: 'DRAFT', intervalSeconds: 0, intervalSecondsList: '[0]', dailyRunTime: schedule.type === 'DAILY' ? schedule.time : null, nextRunAt: null, lastRunAt: null, scheduleConfig: JSON.stringify(schedule), autoAddJoinedGroups, shuffleOrder, createdAt, startedAt: null, completedAt: null });
-    for (const [position, sourceId] of sourceIds.entries()) {
+    await db.insert(campaigns).values({
+      id, accountId: this.accountId, distributionId, sourceAccountId,
+      name: plan.name, sourceMessageReference: plan.sourceIds[0], status: 'DRAFT', intervalSeconds: 0, intervalSecondsList: '[0]',
+      dailyRunTime: plan.schedule.type === 'DAILY' ? plan.schedule.time : null, nextRunAt: null, lastRunAt: null,
+      scheduleConfig: JSON.stringify(plan.schedule), autoAddJoinedGroups: plan.autoAddJoinedGroups, shuffleOrder: plan.shuffleOrder,
+      deliveryMode: plan.deliveryMode, targetAllGroups: plan.targetAllGroups,
+      createdAt, startedAt: null, completedAt: null,
+    });
+    for (const [position, sourceId] of plan.sourceIds.entries()) {
       await db.insert(campaignSources).values({ id: randomUUID(), campaignId: id, sourceMessageId: sourceId, position, createdAt });
     }
     for (const [position, jid] of groupJids.entries()) {
@@ -415,43 +517,118 @@ export class CampaignService {
     return { ...(await this.get(id)), warnings: cooldownWarnings(selectedGroups) };
   }
 
+  public async create(input: CampaignInput) {
+    const plan = await this.plan(input);
+    return this.createFromPlan(plan, plan.groupJids);
+  }
+
   public async list() {
     const rows = await db.select().from(campaigns).where(eq(campaigns.accountId, this.accountId)).orderBy(asc(campaigns.createdAt));
-    return Promise.all(rows.map((campaign) => this.get(campaign.id)));
+    if (rows.length === 0) return [];
+    const ids = rows.map((campaign) => campaign.id);
+    const targetRows = await db.select().from(campaignTargets)
+      .where(inArray(campaignTargets.campaignId, ids))
+      .orderBy(asc(campaignTargets.campaignId), asc(campaignTargets.position));
+    // One query for every source row instead of one campaign detail query per
+    // campaign, and only a payload prefix instead of the megabytes of base64
+    // stored after it.
+    const sourceRows = await db.select({
+      campaignId: campaignSources.campaignId,
+      sourceMessageId: campaignSources.sourceMessageId,
+      prefix: sql<string>`substr(${sourceMessages.payload}, 1, 160)`,
+      preview: sourceMessages.preview,
+    })
+      .from(campaignSources)
+      .innerJoin(sourceMessages, eq(campaignSources.sourceMessageId, sourceMessages.id))
+      .where(inArray(campaignSources.campaignId, ids))
+      .orderBy(asc(campaignSources.campaignId), asc(campaignSources.position));
+    const legacyIds = [...new Set(rows
+      .filter((campaign) => !sourceRows.some((source) => source.campaignId === campaign.id))
+      .map((campaign) => campaign.sourceMessageReference))];
+    const legacyRows = legacyIds.length === 0 ? [] : await db.select({
+      id: sourceMessages.id,
+      prefix: sql<string>`substr(${sourceMessages.payload}, 1, 160)`,
+      preview: sourceMessages.preview,
+    }).from(sourceMessages)
+      .where(inArray(sourceMessages.id, legacyIds));
+    const legacyById = new Map(legacyRows.map((row) => [row.id, row]));
+
+    const targetJids = [...new Set(targetRows.map((target) => target.groupJid))];
+    const recent = targetJids.length === 0 ? [] : await db.select({ jid: groups.whatsappGroupJid, lastCampaignSentAt: groups.lastCampaignSentAt })
+      .from(groups).where(and(eq(groups.accountId, this.accountId), inArray(groups.whatsappGroupJid, targetJids)));
+    const recentByJid = new Map(recent.map((group) => [group.jid, group]));
+
+    const targetsByCampaign = new Map<string, (typeof targetRows)[number][]>();
+    for (const target of targetRows) {
+      const list = targetsByCampaign.get(target.campaignId) ?? [];
+      list.push(target);
+      targetsByCampaign.set(target.campaignId, list);
+    }
+    const sourcesByCampaign = new Map<string, (typeof sourceRows)[number][]>();
+    for (const source of sourceRows) {
+      const list = sourcesByCampaign.get(source.campaignId) ?? [];
+      list.push(source);
+      sourcesByCampaign.set(source.campaignId, list);
+    }
+
+    return rows.map((campaign) => {
+      const targets = targetsByCampaign.get(campaign.id) ?? [];
+      let sources: CapturedSource[] = (sourcesByCampaign.get(campaign.id) ?? [])
+        .map((source) => ({ id: source.sourceMessageId, kind: sourceKindFromPrefix(source.prefix), preview: source.preview }));
+      if (sources.length === 0) {
+        const legacy = legacyById.get(campaign.sourceMessageReference);
+        if (legacy) sources = [{ id: legacy.id, kind: sourceKindFromPrefix(legacy.prefix), preview: legacy.preview }];
+      }
+      const warnings = cooldownWarnings(targets.flatMap((target) => {
+        const group = recentByJid.get(target.groupJid);
+        return group ? [group] : [];
+      }));
+      // Editing loads the detail endpoint, so the polled list can stay small.
+      return { ...campaign, targets, sources, sourceContent: null, warnings };
+    });
   }
 
   public async get(id: string) {
     const [campaign] = await db.select().from(campaigns).where(and(eq(campaigns.id, id), eq(campaigns.accountId, this.accountId))).limit(1);
     if (!campaign) throw new Error('Campaign not found.');
+    // A distributed campaign's source messages stay owned by the account that
+    // captured them, even when a different account sends this shard.
+    const sourceAccountId = campaign.sourceAccountId ?? this.accountId;
     const targets = await db.select().from(campaignTargets).where(eq(campaignTargets.campaignId, id)).orderBy(asc(campaignTargets.position));
-    const sourceRows = await db.select({ id: campaignSources.id, sourceMessageId: campaignSources.sourceMessageId, payload: sourceMessages.payload, preview: sourceMessages.preview })
+    // Read only a payload prefix plus the JSON text fields: selecting the full
+    // payload pulled megabytes of base64 into Node for every campaign load.
+    const sourceFields = {
+      id: sourceMessages.id,
+      prefix: sql<string>`substr(${sourceMessages.payload}, 1, 160)`,
+      text: sql<string | null>`case when json_valid(${sourceMessages.payload}) then json_extract(${sourceMessages.payload}, '$.text') end`,
+      caption: sql<string | null>`case when json_valid(${sourceMessages.payload}) then json_extract(${sourceMessages.payload}, '$.caption') end`,
+      preview: sourceMessages.preview,
+    };
+    const sourceRows = await db.select({ ...sourceFields, sourceMessageId: campaignSources.sourceMessageId })
       .from(campaignSources)
       .innerJoin(sourceMessages, eq(campaignSources.sourceMessageId, sourceMessages.id))
-      .where(and(eq(campaignSources.campaignId, id), eq(sourceMessages.accountId, this.accountId)))
+      .where(and(eq(campaignSources.campaignId, id), eq(sourceMessages.accountId, sourceAccountId)))
       .orderBy(asc(campaignSources.position));
     // Legacy campaigns (created before campaign_sources existed) have no rows;
     // fall back to the single source_message_reference entry.
-    let firstPayload: string | null = null;
+    let first: { prefix: string; text: string | null; caption: string | null } | null = null;
     let sources: CapturedSource[] = [];
     if (sourceRows.length) {
-      sources = sourceRows.map((row) => ({ id: row.sourceMessageId, kind: sourceKindFromPayload(row.payload), preview: row.preview }));
-      firstPayload = sourceRows[0].payload;
+      sources = sourceRows.map((row) => ({ id: row.sourceMessageId, kind: sourceKindFromPrefix(row.prefix), preview: row.preview }));
+      first = sourceRows[0];
     } else {
-      const [source] = await db.select({ payload: sourceMessages.payload, preview: sourceMessages.preview }).from(sourceMessages)
-        .where(and(eq(sourceMessages.id, campaign.sourceMessageReference), eq(sourceMessages.accountId, this.accountId))).limit(1);
+      const [source] = await db.select(sourceFields).from(sourceMessages)
+        .where(and(eq(sourceMessages.id, campaign.sourceMessageReference), eq(sourceMessages.accountId, sourceAccountId))).limit(1);
       if (source) {
-        firstPayload = source.payload;
-        sources = [{ id: campaign.sourceMessageReference, kind: sourceKindFromPayload(source.payload), preview: source.preview }];
+        first = source;
+        sources = [{ id: campaign.sourceMessageReference, kind: sourceKindFromPrefix(source.prefix), preview: source.preview }];
       }
     }
-    let sourceContent: { text: string; hasImage: boolean } | null = null;
-    try {
-      const parsed = firstPayload ? JSON.parse(firstPayload) as { text?: unknown; caption?: unknown; imageDataUrl?: unknown } : null;
-      const text = typeof parsed?.text === 'string' ? parsed.text : typeof parsed?.caption === 'string' ? parsed.caption : '';
-      // Legacy semantics: a legacy image payload has imageDataUrl, so the first
-      // source being an image (hasImage true) is preserved for edit prefill.
-      sourceContent = { text, hasImage: typeof parsed?.imageDataUrl === 'string' };
-    } catch { /* A broken legacy source remains visible as a campaign but cannot be prefilled. */ }
+    // Legacy semantics: hasImage follows whether the first source is an image.
+    const text = typeof first?.text === 'string' ? first.text : typeof first?.caption === 'string' ? first.caption : '';
+    const sourceContent: { text: string; hasImage: boolean } | null = first
+      ? { text, hasImage: sourceKindFromPrefix(first.prefix) === 'image' }
+      : null;
     const recent = await db.select({ jid: groups.whatsappGroupJid, lastCampaignSentAt: groups.lastCampaignSentAt }).from(groups)
       .where(and(eq(groups.accountId, this.accountId), inArray(groups.whatsappGroupJid, targets.map((target) => target.groupJid))));
     return { ...campaign, targets, sources, sourceContent, warnings: cooldownWarnings(recent) };
@@ -459,6 +636,9 @@ export class CampaignService {
 
   public async start(id: string) {
     const campaign = await this.requireStatus(id, ['DRAFT', 'QUEUED', 'PAUSED']);
+    if (campaign.deliveryMode === 'GROUP_STATUS' && this.whatsapp.getStatus().state !== 'CONNECTED') {
+      throw new Error('WhatsApp must be connected before starting a group-status campaign.');
+    }
     // An operator deliberately (re)starting a campaign clears the account
     // circuit breaker: they have chosen to retry, so failures count fresh.
     this.circuitOpen = false;
@@ -483,6 +663,9 @@ export class CampaignService {
   public async runNow(id: string) {
     const [campaign] = await db.select().from(campaigns).where(and(eq(campaigns.id, id), eq(campaigns.accountId, this.accountId))).limit(1);
     if (!campaign) throw new Error('Campaign not found.');
+    if (campaign.deliveryMode === 'GROUP_STATUS' && this.whatsapp.getStatus().state !== 'CONNECTED') {
+      throw new Error('WhatsApp must be connected before starting a group-status campaign.');
+    }
     // Same operator-action semantics as start(): retrying is a fresh start.
     this.circuitOpen = false;
     this.consecutiveSendFailures = 0;
@@ -506,30 +689,34 @@ export class CampaignService {
 
   public async update(id: string, input: CampaignInput) {
     const campaign = await this.requireStatus(id, ['DRAFT', 'QUEUED', 'RUNNING', 'PAUSED', 'COMPLETED', 'STOPPED']);
-    const name = validText(input.name, 'name', 120);
-    const sourceIds = await this.resolveSourceMessageIds(input.sourceMessageIds, input.sourceMessageId);
-    const groupJids = validateExplicitTargets(input.groupJids);
-    const autoAddJoinedGroups = autoAddJoinedGroupsFrom(input.autoAddJoinedGroups);
-    const shuffleOrder = shuffleOrderFrom(input.shuffleOrder);
-    const schedule = input.schedule === undefined && input.dailyRunTime ? validateSchedule({ type: 'DAILY', time: input.dailyRunTime }) : validateSchedule(input.schedule);
-    const selectedGroups = await db.select({ jid: groups.whatsappGroupJid, name: groups.name, isExcluded: groups.isExcluded })
-      .from(groups).where(and(eq(groups.accountId, this.accountId), inArray(groups.whatsappGroupJid, groupJids)));
-    const byJid = new Map(selectedGroups.map((group) => [group.jid, group]));
-    if (groupJids.some((jid) => !byJid.has(jid))) throw new Error('Every target must be a group synced from the linked WhatsApp account.');
-    if (selectedGroups.some((group) => group.isExcluded)) throw new Error('Excluded groups cannot be included in a campaign. Remove the exclusion first if you want to use one.');
+    // Source messages are validated against the account that owns them, not
+    // necessarily the account sending this shard.
+    const plan = await this.plan(input, campaign.sourceAccountId ?? this.accountId);
+    return this.updateFromPlan(id, plan, plan.groupJids);
+  }
 
-    const scheduleConfig = JSON.stringify(schedule);
+  /** Apply a validated plan to one campaign row (a shard when distributed). */
+  public async updateFromPlan(id: string, plan: CampaignPlan, groupJids: string[], sourceAccountId?: string) {
+    const campaign = await this.requireStatus(id, ['DRAFT', 'QUEUED', 'RUNNING', 'PAUSED', 'COMPLETED', 'STOPPED']);
+    if (plan.deliveryMode !== campaign.deliveryMode) {
+      throw new Error('A campaign cannot change its delivery mode; create a new campaign instead.');
+    }
+    const sourceOwner = sourceAccountId ?? campaign.sourceAccountId ?? this.accountId;
+    const { byJid } = await this.selectTargets(groupJids);
+
+    const scheduleConfig = JSON.stringify(plan.schedule);
     const scheduleChanged = campaign.scheduleConfig !== scheduleConfig;
     const nextRunAt = campaign.status === 'RUNNING' && !scheduleChanged
       ? campaign.nextRunAt
-      : schedule.type === 'ONCE' ? null : nextScheduledRunAt(schedule);
+      : plan.schedule.type === 'ONCE' ? null : nextScheduledRunAt(plan.schedule);
     await db.update(campaigns).set({
-      name, sourceMessageReference: sourceIds[0], intervalSeconds: 0, intervalSecondsList: '[0]',
-      dailyRunTime: schedule.type === 'DAILY' ? schedule.time : null, scheduleConfig,
-      autoAddJoinedGroups, shuffleOrder, nextRunAt, lastRunAt: campaign.status === 'RUNNING' ? campaign.lastRunAt : null,
+      name: plan.name, sourceMessageReference: plan.sourceIds[0], intervalSeconds: 0, intervalSecondsList: '[0]',
+      dailyRunTime: plan.schedule.type === 'DAILY' ? plan.schedule.time : null, scheduleConfig, sourceAccountId: sourceOwner,
+      autoAddJoinedGroups: plan.autoAddJoinedGroups, shuffleOrder: plan.shuffleOrder, targetAllGroups: plan.targetAllGroups, nextRunAt,
+      lastRunAt: campaign.status === 'RUNNING' ? campaign.lastRunAt : null,
       completedAt: campaign.status === 'COMPLETED' ? null : campaign.completedAt,
     }).where(eq(campaigns.id, id));
-    await this.syncCampaignSources(id, sourceIds);
+    await this.syncCampaignSources(id, plan.sourceIds);
     if (campaign.status === 'RUNNING') {
       // A live edit must never delete delivery history or a row currently
       // sending. New choices join the remaining queue; removed unsent rows are
@@ -644,7 +831,7 @@ export class CampaignService {
     const [eligible] = await db.select({ isExcluded: groups.isExcluded }).from(groups)
       .where(and(eq(groups.accountId, this.accountId), eq(groups.whatsappGroupJid, group.jid))).limit(1);
     if (!eligible || eligible.isExcluded) return;
-    const recipients = await db.select({ id: campaigns.id, status: campaigns.status }).from(campaigns).where(and(
+    const recipients = await db.select({ id: campaigns.id, status: campaigns.status, distributionId: campaigns.distributionId }).from(campaigns).where(and(
       eq(campaigns.accountId, this.accountId),
       eq(campaigns.autoAddJoinedGroups, true),
       inArray(campaigns.status, ['DRAFT', 'QUEUED', 'RUNNING', 'PAUSED']),
@@ -653,6 +840,13 @@ export class CampaignService {
       const existing = await db.select({ id: campaignTargets.id }).from(campaignTargets)
         .where(and(eq(campaignTargets.campaignId, campaign.id), eq(campaignTargets.groupJid, group.jid))).limit(1);
       if (existing.length) continue;
+      // A distributed campaign must send to a group once, not once per shard.
+      if (campaign.distributionId) {
+        const [shared] = await db.select({ id: campaignTargets.id }).from(campaignTargets)
+          .innerJoin(campaigns, eq(campaignTargets.campaignId, campaigns.id))
+          .where(and(eq(campaigns.distributionId, campaign.distributionId), eq(campaignTargets.groupJid, group.jid))).limit(1);
+        if (shared) continue;
+      }
       const rows = await db.select({ position: campaignTargets.position }).from(campaignTargets).where(eq(campaignTargets.campaignId, campaign.id)).orderBy(asc(campaignTargets.position));
       const position = (rows.at(-1)?.position ?? -1) + 1;
       await db.insert(campaignTargets).values({ id: randomUUID(), campaignId: campaign.id, groupJid: group.jid, groupName: group.name, position, status: 'QUEUED', scheduledAt: null, sentAt: null, errorMessage: null, attemptCount: 0 });
@@ -661,22 +855,84 @@ export class CampaignService {
     }
   }
 
+  /**
+   * Add groups joined since the campaign was created and cancel groups the
+   * account left. An empty live list is a transient fetch failure, not an
+   * empty account, and must never cancel every target.
+   */
+  private async reconcileAllGroupTargets(campaignId: string, liveJids: string[]): Promise<void> {
+    if (liveJids.length === 0) return;
+    const existing = await db.select({ id: campaignTargets.id, groupJid: campaignTargets.groupJid, status: campaignTargets.status, position: campaignTargets.position })
+      .from(campaignTargets).where(eq(campaignTargets.campaignId, campaignId));
+    const known = new Set(existing.map((target) => target.groupJid));
+    const live = new Set(liveJids);
+    const missingJids = liveJids.filter((jid) => !known.has(jid));
+    if (missingJids.length > 0) {
+      const groupsToAdd = await db.select({ jid: groups.whatsappGroupJid, name: groups.name }).from(groups)
+        .where(and(eq(groups.accountId, this.accountId), eq(groups.isExcluded, false), inArray(groups.whatsappGroupJid, missingJids)));
+      let position = existing.reduce((max, target) => Math.max(max, target.position), -1) + 1;
+      for (const group of groupsToAdd) {
+        await db.insert(campaignTargets).values({
+          id: randomUUID(), campaignId, groupJid: group.jid, groupName: group.name, position,
+          status: 'QUEUED', scheduledAt: null, sentAt: null, errorMessage: null, attemptCount: 0,
+        }).onConflictDoNothing();
+        position += 1;
+      }
+    }
+    const staleIds = existing
+      .filter((target) => !live.has(target.groupJid) && (target.status === 'QUEUED' || target.status === 'WAITING' || target.status === 'FAILED'))
+      .map((target) => target.id);
+    if (staleIds.length > 0) {
+      await db.update(campaignTargets).set({ status: 'CANCELLED', errorMessage: 'The account is no longer a member of this group.' })
+        .where(inArray(campaignTargets.id, staleIds));
+    }
+  }
+
+  /** Send a status source as an ordinary group message for a Community group. */
+  private async sendFallbackMessage(socket: WASocket, groupJid: string, content: GroupStatusContent): Promise<void> {
+    if ('text' in content) {
+      await socket.sendMessage(groupJid, { text: content.text });
+    } else if ('image' in content) {
+      await socket.sendMessage(groupJid, { image: content.image, caption: content.caption, mimetype: 'image/jpeg' });
+    } else {
+      await socket.sendMessage(groupJid, { video: content.video, caption: content.caption, mimetype: 'video/mp4' });
+    }
+  }
+
+  /** One status payload: text, an image with caption, or a gated video. */
+  private async statusContentFromPayload(payload: string): Promise<GroupStatusContent> {
+    const content: unknown = JSON.parse(payload);
+    if (!content || typeof content !== 'object') throw new Error('The stored source message is invalid.');
+    const source = content as { text?: unknown; imageDataUrl?: unknown; videoDataUrl?: unknown; caption?: unknown };
+    if (typeof source.imageDataUrl === 'string' && typeof source.caption === 'string') {
+      const image = await prepareCampaignImage(source.imageDataUrl);
+      return { image: image.image, caption: source.caption };
+    }
+    if (typeof source.videoDataUrl === 'string' && typeof source.caption === 'string') {
+      if (!GROUP_STATUS_VIDEO_SUPPORTED) throw new Error('Group-status video is not supported yet; use text or an image.');
+      const encoded = source.videoDataUrl.slice(source.videoDataUrl.indexOf(',') + 1);
+      return { video: Buffer.from(encoded, 'base64'), caption: source.caption };
+    }
+    if (typeof source.text === 'string') return { text: source.text };
+    throw new Error('The stored source message is invalid.');
+  }
+
   /** Ordered source payloads for delivery: campaign_sources rows by position,
    *  or the legacy single source_message_reference when no rows exist. Any
    *  missing referenced message is a hard error so the target fails cleanly. */
-  private async loadOrderedSourcesForSend(campaignId: string, fallbackReference: string): Promise<Array<{ id: string; payload: string }>> {
+  private async loadOrderedSourcesForSend(campaignId: string, fallbackReference: string, sourceAccountId = this.accountId): Promise<Array<{ id: string; payload: string }>> {
     const stored = await db.select({ sourceMessageId: campaignSources.sourceMessageId }).from(campaignSources)
       .where(eq(campaignSources.campaignId, campaignId)).orderBy(asc(campaignSources.position));
     if (stored.length) {
       const rows = await db.select({ id: sourceMessages.id, payload: sourceMessages.payload }).from(sourceMessages)
-        .where(and(eq(sourceMessages.accountId, this.accountId), inArray(sourceMessages.id, stored.map((row) => row.sourceMessageId))));
+        .where(and(eq(sourceMessages.accountId, sourceAccountId), inArray(sourceMessages.id, stored.map((row) => row.sourceMessageId))));
       const byId = new Map(rows.map((row) => [row.id, row]));
       const ordered = stored.map((row) => byId.get(row.sourceMessageId));
       if (ordered.some((row) => !row)) throw new Error('The campaign source message no longer exists.');
       return ordered as Array<{ id: string; payload: string }>;
     }
     const [source] = await db.select({ id: sourceMessages.id, payload: sourceMessages.payload }).from(sourceMessages)
-      .where(and(eq(sourceMessages.id, fallbackReference), eq(sourceMessages.accountId, this.accountId))).limit(1);
+      .where(and(eq(sourceMessages.id, fallbackReference), eq(sourceMessages.accountId, sourceAccountId))).limit(1);
     if (!source) throw new Error('The campaign source message no longer exists.');
     return [{ id: source.id, payload: source.payload }];
   }
@@ -693,6 +949,18 @@ export class CampaignService {
     while (true) {
       const [campaign] = await db.select().from(campaigns).where(and(eq(campaigns.id, id), eq(campaigns.accountId, this.accountId))).limit(1);
       if (!campaign || campaign.status !== 'RUNNING') return;
+      const statusMode = campaign.deliveryMode === 'GROUP_STATUS';
+      if (statusMode && campaign.targetAllGroups) {
+        const lastReconcile = this.lastAllGroupReconcile.get(id) ?? 0;
+        if (Date.now() - lastReconcile >= (this.pacing.statusReconcileIntervalMs ?? 600_000)) {
+          try {
+            await this.reconcileAllGroupTargets(id, await this.whatsapp.participatingGroupJids());
+            this.lastAllGroupReconcile.set(id, Date.now());
+          } catch (error) {
+            this.logger.warn({ err: error, campaignId: id }, 'Unable to reconcile all-group status targets');
+          }
+        }
+      }
       // Pacing, budgets, grace and cooldown are frozen in safety/limits.ts and
       // drawn fresh from random ranges on every use — nothing here is loaded
       // from the database or configurable.
@@ -733,7 +1001,7 @@ export class CampaignService {
           const lastRunAt = now();
           const nextRunAt = nextScheduledRunAt(schedule, new Date(lastRunAt));
           await db.update(campaignTargets).set({ status: 'QUEUED', scheduledAt: nextRunAt, sentAt: null, errorMessage: null, attemptCount: 0 })
-            .where(eq(campaignTargets.campaignId, id));
+            .where(and(eq(campaignTargets.campaignId, id), ne(campaignTargets.status, 'CANCELLED')));
           await db.update(campaigns).set({ nextRunAt, lastRunAt, completedAt: null }).where(and(eq(campaigns.id, id), eq(campaigns.status, 'RUNNING')));
           continue;
         }
@@ -743,12 +1011,15 @@ export class CampaignService {
       if (!canDeliverTarget(target.status)) continue;
       // A group may be excluded after a campaign was created. Respect that
       // preference at the moment of delivery as well as at campaign creation.
-      const [recipient] = await db.select({ isExcluded: groups.isExcluded, joinedAt: groups.joinedAt, lastCampaignSentAt: groups.lastCampaignSentAt }).from(groups).where(and(eq(groups.accountId, this.accountId), eq(groups.whatsappGroupJid, target.groupJid))).limit(1);
+      const [recipient] = await db.select({ isExcluded: groups.isExcluded, joinedAt: groups.joinedAt, lastCampaignSentAt: groups.lastCampaignSentAt, lastStatusSentAt: groups.lastStatusSentAt, communityParentJid: groups.communityParentJid }).from(groups).where(and(eq(groups.accountId, this.accountId), eq(groups.whatsappGroupJid, target.groupJid))).limit(1);
       if (!recipient || recipient.isExcluded) {
         await db.update(campaignTargets).set({ status: 'CANCELLED', errorMessage: 'Group was excluded before this campaign could send.' })
           .where(eq(campaignTargets.id, target.id));
         continue;
       }
+      // WhatsApp silently drops group statuses in Community-linked groups. The
+      // operator chose to reach those groups with an ordinary group message.
+      const fallbackMessage = statusMode && Boolean(recipient.communityParentJid);
       // New groups get a grace period before their first campaign send, and
       // every group honors a cooldown since its last campaign send. The target
       // is parked as WAITING with a future scheduledAt; the pick filter above
@@ -768,11 +1039,15 @@ export class CampaignService {
       if (!parkedRow && recipient.joinedAt && Number.isFinite(Date.parse(recipient.joinedAt))) {
         blockedUntilMs = Math.max(blockedUntilMs, Date.parse(recipient.joinedAt) + drawGroupGraceMs());
       }
-      const lastSendMs = recipient.lastCampaignSentAt && Number.isFinite(Date.parse(recipient.lastCampaignSentAt))
-        ? Date.parse(recipient.lastCampaignSentAt)
-        : 0;
-      if (lastSendMs > 0 && lastSendMs + GROUP_COOLDOWN.minHours * 3_600_000 > Date.now()) {
-        blockedUntilMs = Math.max(blockedUntilMs, lastSendMs + drawGroupCooldownMs());
+      // A Community fallback is a normal group message, so it must respect the
+      // message cooldown as well as the status cadence.
+      const lastSendCandidates = fallbackMessage
+        ? [recipient.lastStatusSentAt, recipient.lastCampaignSentAt]
+        : [statusMode ? recipient.lastStatusSentAt : recipient.lastCampaignSentAt];
+      const lastSendMs = Math.max(0, ...lastSendCandidates.map((value) => value && Number.isFinite(Date.parse(value)) ? Date.parse(value) : 0));
+      const cooldownMinMs = (statusMode ? STATUS_GROUP_COOLDOWN.minHours : GROUP_COOLDOWN.minHours) * 3_600_000;
+      if (lastSendMs > 0 && lastSendMs + cooldownMinMs > Date.now()) {
+        blockedUntilMs = Math.max(blockedUntilMs, lastSendMs + (statusMode ? drawStatusGroupCooldownMs() : drawGroupCooldownMs()));
       }
       if (blockedUntilMs > Date.now()) {
         await db.update(campaignTargets).set({ status: 'WAITING', scheduledAt: new Date(blockedUntilMs).toISOString(), errorMessage: null })
@@ -816,68 +1091,90 @@ export class CampaignService {
       // Hoisted so the catch below can use it if loading the sources throws.
       let sources: Array<{ id: string; payload: string }> = [];
       try {
-        sources = await this.loadOrderedSourcesForSend(id, campaign.sourceMessageReference);
+        sources = await this.loadOrderedSourcesForSend(id, campaign.sourceMessageReference, campaign.sourceAccountId ?? this.accountId);
         const socket = this.whatsapp.getSocket();
         if (!socket || this.whatsapp.getStatus().state !== 'CONNECTED') throw new Error('WhatsApp is not connected.');
-        for (const source of sources) {
-          // Enforce the daily send budget per message. A campaign that hits the
-          // limit mid-file pauses itself so nothing further goes out until the
-          // daily budget resets (UTC midnight) and the campaign is resumed. The
-          // target is released back to QUEUED, never left SENDING.
-          if (await sendsToday(this.accountId) >= SEND_DAILY_LIMIT) {
-            await db.update(campaignTargets).set({ status: 'QUEUED', errorMessage: 'Daily send budget reached; queued for the next run.' })
-              .where(eq(campaignTargets.id, target.id));
-            await this.pauseForDailyBudget(id);
-            return;
-          }
-          const content: unknown = JSON.parse(source.payload);
-          if (!content || typeof content !== 'object') throw new Error('The stored source message is invalid.');
-          const sourceContent = content as { text?: unknown; imageDataUrl?: unknown; videoDataUrl?: unknown; caption?: unknown };
-          if (typeof sourceContent.imageDataUrl === 'string' && typeof sourceContent.caption === 'string') {
-            const image = await prepareCampaignImage(sourceContent.imageDataUrl);
-            // Locals capture the typeof narrowing: the queued closure re-reads
-            // nothing from the parsed object, whose types do not narrow across
-            // function boundaries.
-            const caption = sourceContent.caption;
-            const sent = await this.enqueueAccountSend(async () => {
-              await socket.sendMessage(target.groupJid, {
-                image: image.image,
-                caption,
-                mimetype: 'image/jpeg',
-                jpegThumbnail: image.jpegThumbnail.toString('base64'),
-                width: image.width,
-                height: image.height,
-              });
-            }, this.pacing.minSendGapSeconds * 1_000, id);
-            if (!sent) { await this.releaseInterruptedTarget(id, target.id); return; }
-          } else if (typeof sourceContent.videoDataUrl === 'string' && typeof sourceContent.caption === 'string') {
-            const encoded = sourceContent.videoDataUrl.slice(sourceContent.videoDataUrl.indexOf(',') + 1);
-            const video = Buffer.from(encoded, 'base64');
-            const caption = sourceContent.caption;
-            // No thumbnail is generated by our code (that would need ffmpeg in
-            // our pipeline); Baileys computes one internally when jpegThumbnail
-            // is omitted (see Utils/messages.js: requiresThumbnailComputation).
-            const sent = await this.enqueueAccountSend(async () => {
-              await socket.sendMessage(target.groupJid, { video, caption, mimetype: 'video/mp4' });
-            }, this.pacing.minSendGapSeconds * 1_000, id);
-            if (!sent) { await this.releaseInterruptedTarget(id, target.id); return; }
-          } else if (typeof sourceContent.text === 'string') {
-            const text = sourceContent.text;
-            const sent = await this.enqueueAccountSend(async () => {
-              await socket.sendMessage(target.groupJid, { text });
-            }, this.pacing.minSendGapSeconds * 1_000, id);
-            if (!sent) { await this.releaseInterruptedTarget(id, target.id); return; }
-          } else throw new Error('The stored source message is invalid.');
-          // A fresh random gap after every file delivered, so a group's files
-          // are paced like consecutive sends across the whole account. The
-          // serial queue above already guarantees the minimum spacing; this
-          // wait adds the randomized delay on top.
+        if (statusMode) {
+          // One status per group per pass, picked from the source pool. The
+          // serial queue enforces the account-wide minimum gap; the random wait
+          // below adds the same per-message pacing as a normal campaign.
+          const source = sources[Math.floor(Math.random() * sources.length)];
+          const content = await this.statusContentFromPayload(source.payload);
+          const sent = await this.enqueueAccountSend(async () => {
+            if (fallbackMessage) await this.sendFallbackMessage(socket, target.groupJid, content);
+            else await this.whatsapp.sendGroupStatus(target.groupJid, content);
+          }, this.pacing.minSendGapSeconds * 1_000, id);
+          if (!sent) { await this.releaseInterruptedTarget(id, target.id); return; }
           await wait(this.pacing.sendGapSeconds() * 1_000);
+        } else {
+          for (const source of sources) {
+            // Enforce the daily send budget per message. A campaign that hits the
+            // limit mid-file pauses itself so nothing further goes out until the
+            // daily budget resets (UTC midnight) and the campaign is resumed. The
+            // target is released back to QUEUED, never left SENDING.
+            if (await sendsToday(this.accountId) >= SEND_DAILY_LIMIT) {
+              await db.update(campaignTargets).set({ status: 'QUEUED', errorMessage: 'Daily send budget reached; queued for the next run.' })
+                .where(eq(campaignTargets.id, target.id));
+              await this.pauseForDailyBudget(id);
+              return;
+            }
+            const content: unknown = JSON.parse(source.payload);
+            if (!content || typeof content !== 'object') throw new Error('The stored source message is invalid.');
+            const sourceContent = content as { text?: unknown; imageDataUrl?: unknown; videoDataUrl?: unknown; caption?: unknown };
+            if (typeof sourceContent.imageDataUrl === 'string' && typeof sourceContent.caption === 'string') {
+              const image = await prepareCampaignImage(sourceContent.imageDataUrl);
+              // Locals capture the typeof narrowing: the queued closure re-reads
+              // nothing from the parsed object, whose types do not narrow across
+              // function boundaries.
+              const caption = sourceContent.caption;
+              const sent = await this.enqueueAccountSend(async () => {
+                await socket.sendMessage(target.groupJid, {
+                  image: image.image,
+                  caption,
+                  mimetype: 'image/jpeg',
+                  jpegThumbnail: image.jpegThumbnail.toString('base64'),
+                  width: image.width,
+                  height: image.height,
+                });
+              }, this.pacing.minSendGapSeconds * 1_000, id);
+              if (!sent) { await this.releaseInterruptedTarget(id, target.id); return; }
+            } else if (typeof sourceContent.videoDataUrl === 'string' && typeof sourceContent.caption === 'string') {
+              const encoded = sourceContent.videoDataUrl.slice(sourceContent.videoDataUrl.indexOf(',') + 1);
+              const video = Buffer.from(encoded, 'base64');
+              const caption = sourceContent.caption;
+              // No thumbnail is generated by our code (that would need ffmpeg in
+              // our pipeline); Baileys computes one internally when jpegThumbnail
+              // is omitted (see Utils/messages.js: requiresThumbnailComputation).
+              const sent = await this.enqueueAccountSend(async () => {
+                await socket.sendMessage(target.groupJid, { video, caption, mimetype: 'video/mp4' });
+              }, this.pacing.minSendGapSeconds * 1_000, id);
+              if (!sent) { await this.releaseInterruptedTarget(id, target.id); return; }
+            } else if (typeof sourceContent.text === 'string') {
+              const text = sourceContent.text;
+              const sent = await this.enqueueAccountSend(async () => {
+                await socket.sendMessage(target.groupJid, { text });
+              }, this.pacing.minSendGapSeconds * 1_000, id);
+              if (!sent) { await this.releaseInterruptedTarget(id, target.id); return; }
+            } else throw new Error('The stored source message is invalid.');
+            // A fresh random gap after every file delivered, so a group's files
+            // are paced like consecutive sends across the whole account. The
+            // serial queue above already guarantees the minimum spacing; this
+            // wait adds the randomized delay on top.
+            await wait(this.pacing.sendGapSeconds() * 1_000);
+          }
         }
         const sentAt = now();
         await db.update(campaignTargets).set({ status: 'SENT', sentAt, errorMessage: null })
           .where(and(eq(campaignTargets.id, target.id), ne(campaignTargets.status, 'SENT')));
-        await db.update(groups).set({ lastCampaignSentAt: sentAt, updatedAt: sentAt }).where(and(eq(groups.accountId, this.accountId), eq(groups.whatsappGroupJid, target.groupJid)));
+        if (statusMode) {
+          await db.update(groups).set({
+            lastStatusSentAt: sentAt,
+            ...(fallbackMessage ? { lastCampaignSentAt: sentAt } : {}),
+            updatedAt: sentAt,
+          }).where(and(eq(groups.accountId, this.accountId), eq(groups.whatsappGroupJid, target.groupJid)));
+        } else {
+          await db.update(groups).set({ lastCampaignSentAt: sentAt, updatedAt: sentAt }).where(and(eq(groups.accountId, this.accountId), eq(groups.whatsappGroupJid, target.groupJid)));
+        }
         // A real delivery proves the connection works: the failure streak is over.
         this.consecutiveSendFailures = 0;
       } catch (error) {
