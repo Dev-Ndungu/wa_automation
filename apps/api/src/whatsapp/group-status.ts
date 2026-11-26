@@ -27,8 +27,8 @@ export const GROUP_STATUS_META: BinaryNode = {
   attrs: { is_group_status: 'true', origin: 'group_status' },
 };
 
-/** Flipped to true only after the live spike proves video rendering. */
-export const GROUP_STATUS_VIDEO_SUPPORTED = false;
+/** Proven by the live spike on 2026-11-26 in a non-Community test group. */
+export const GROUP_STATUS_VIDEO_SUPPORTED = true;
 
 type GroupStatusInnerKey = 'extendedTextMessage' | 'imageMessage' | 'videoMessage';
 

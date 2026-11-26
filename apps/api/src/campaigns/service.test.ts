@@ -946,3 +946,17 @@ test('an empty live group list does not cancel targets', async () => {
   const [target] = await db.select().from(campaignTargets).where(eq(campaignTargets.campaignId, created.id));
   assert.equal(target.status, 'QUEUED');
 });
+
+test('a status campaign accepts a video after the live spike proves it', async () => {
+  await insertGroup('video-status@g.us', 'Video status');
+  const captured = await service.captureManualSource({
+    text: 'Video status',
+    label: 'Video status',
+    files: [{ kind: 'video', dataUrl: TINY_VIDEO, name: 'tiny.mp4' }],
+  } as never);
+  const plan = await service.plan({
+    name: 'Video status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['video-status@g.us'], deliveryMode: 'GROUP_STATUS',
+  } as never);
+  assert.equal(plan.deliveryMode, 'GROUP_STATUS');
+});
