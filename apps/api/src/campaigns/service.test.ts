@@ -90,7 +90,7 @@ after(() => {
   }
 });
 
-async function insertGroup(jid: string, name: string, extra?: { joinedAt?: string | null; lastCampaignSentAt?: string | null }, accountId = 'main'): Promise<void> {
+async function insertGroup(jid: string, name: string, extra?: { joinedAt?: string | null; lastCampaignSentAt?: string | null; communityParentJid?: string | null }, accountId = 'main'): Promise<void> {
   const timestamp = new Date().toISOString();
   await db.insert(groups).values({
     id: randomUUID(),
@@ -103,6 +103,7 @@ async function insertGroup(jid: string, name: string, extra?: { joinedAt?: strin
     updatedAt: timestamp,
     joinedAt: extra?.joinedAt ?? null,
     lastCampaignSentAt: extra?.lastCampaignSentAt ?? null,
+    communityParentJid: extra?.communityParentJid ?? null,
   });
 }
 
@@ -959,4 +960,54 @@ test('a status campaign accepts a video after the live spike proves it', async (
     groupJids: ['video-status@g.us'], deliveryMode: 'GROUP_STATUS',
   } as never);
   assert.equal(plan.deliveryMode, 'GROUP_STATUS');
+});
+
+test('a status campaign sends a normal message to a Community-linked group', async () => {
+  await insertGroup('community-status@g.us', 'Community status', { communityParentJid: 'parent@g.us' });
+  await insertGroup('normal-status@g.us', 'Normal status');
+  const captured = await service.captureManualSource({ text: 'Fallback status', label: 'Fallback status' });
+  const created = await service.create({
+    name: 'Fallback status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['community-status@g.us', 'normal-status@g.us'],
+    deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  } as never);
+  statusCalls.length = 0;
+  sentCalls.length = 0;
+  await service.start(created.id);
+  await waitForTargetsSent(created.id, 10_000, 2);
+
+  assert.deepEqual(statusCalls.map((call) => call.jid), ['normal-status@g.us']);
+  assert.deepEqual(sentCalls.map((call) => call.jid), ['community-status@g.us']);
+  assert.deepEqual(sentCalls[0].content, { text: 'Fallback status' });
+
+  const rows = await db.select({ jid: groups.whatsappGroupJid, lastStatusSentAt: groups.lastStatusSentAt, lastCampaignSentAt: groups.lastCampaignSentAt })
+    .from(groups).where(inArray(groups.whatsappGroupJid, ['community-status@g.us', 'normal-status@g.us']));
+  const community = rows.find((row) => row.jid === 'community-status@g.us')!;
+  const normal = rows.find((row) => row.jid === 'normal-status@g.us')!;
+  assert.ok(community.lastStatusSentAt);
+  assert.ok(community.lastCampaignSentAt);
+  assert.ok(normal.lastStatusSentAt);
+  assert.equal(normal.lastCampaignSentAt, null);
+});
+
+test('a Community fallback respects the message cooldown', async () => {
+  await insertGroup('community-cool@g.us', 'Community cool', {
+    communityParentJid: 'parent@g.us',
+    lastCampaignSentAt: new Date(Date.now() - 3_600_000).toISOString(),
+  });
+  const captured = await service.captureManualSource({ text: 'Community cool', label: 'Community cool' });
+  const created = await service.create({
+    name: 'Community cool', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['community-cool@g.us'], deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  } as never);
+  statusCalls.length = 0;
+  sentCalls.length = 0;
+  await service.start(created.id);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const [target] = await db.select().from(campaignTargets).where(eq(campaignTargets.campaignId, created.id));
+  assert.equal(target.status, 'WAITING');
+  const delay = Date.parse(target.scheduledAt!) - Date.now();
+  assert.ok(delay >= 47 * 3_600_000 && delay <= 97 * 3_600_000);
+  assert.equal(sentCalls.length, 0);
+  await service.stop(created.id);
 });

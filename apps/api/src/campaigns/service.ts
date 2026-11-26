@@ -7,6 +7,7 @@ import { db } from '../db/client.js';
 import { campaignSources, campaignTargets, campaigns, groups, operationalLogs, sourceMessages } from '../db/schema.js';
 import type { WhatsAppManager, WhatsAppStatus } from '../whatsapp/manager.js';
 import { GROUP_STATUS_VIDEO_SUPPORTED } from '../whatsapp/group-status.js';
+import type { WASocket } from '@whiskeysockets/baileys';
 import type { GroupStatusContent } from '../whatsapp/group-status.js';
 import { CIRCUIT_BREAKER_CONSECUTIVE_FAILURES, drawCampaignWarmupSeconds, drawGroupCooldownMs, drawGroupGraceMs, drawReconnectSettleSeconds, drawSendGapSeconds, drawStatusGroupCooldownMs, GROUP_COOLDOWN, millisecondsUntilDailyBudgetResets, millisecondsUntilSendWindowOpens, recordSend, SEND_DAILY_LIMIT, SEND_GAP, sendsToday, STATUS_GROUP_COOLDOWN } from '../safety/limits.js';
 import { canDeliverTarget, cooldownWarnings, type CampaignSchedule, validateExplicitTargets, validateSchedule } from './policy.js';
@@ -887,6 +888,17 @@ export class CampaignService {
     }
   }
 
+  /** Send a status source as an ordinary group message for a Community group. */
+  private async sendFallbackMessage(socket: WASocket, groupJid: string, content: GroupStatusContent): Promise<void> {
+    if ('text' in content) {
+      await socket.sendMessage(groupJid, { text: content.text });
+    } else if ('image' in content) {
+      await socket.sendMessage(groupJid, { image: content.image, caption: content.caption, mimetype: 'image/jpeg' });
+    } else {
+      await socket.sendMessage(groupJid, { video: content.video, caption: content.caption, mimetype: 'video/mp4' });
+    }
+  }
+
   /** One status payload: text, an image with caption, or a gated video. */
   private async statusContentFromPayload(payload: string): Promise<GroupStatusContent> {
     const content: unknown = JSON.parse(payload);
@@ -999,12 +1011,15 @@ export class CampaignService {
       if (!canDeliverTarget(target.status)) continue;
       // A group may be excluded after a campaign was created. Respect that
       // preference at the moment of delivery as well as at campaign creation.
-      const [recipient] = await db.select({ isExcluded: groups.isExcluded, joinedAt: groups.joinedAt, lastCampaignSentAt: groups.lastCampaignSentAt, lastStatusSentAt: groups.lastStatusSentAt }).from(groups).where(and(eq(groups.accountId, this.accountId), eq(groups.whatsappGroupJid, target.groupJid))).limit(1);
+      const [recipient] = await db.select({ isExcluded: groups.isExcluded, joinedAt: groups.joinedAt, lastCampaignSentAt: groups.lastCampaignSentAt, lastStatusSentAt: groups.lastStatusSentAt, communityParentJid: groups.communityParentJid }).from(groups).where(and(eq(groups.accountId, this.accountId), eq(groups.whatsappGroupJid, target.groupJid))).limit(1);
       if (!recipient || recipient.isExcluded) {
         await db.update(campaignTargets).set({ status: 'CANCELLED', errorMessage: 'Group was excluded before this campaign could send.' })
           .where(eq(campaignTargets.id, target.id));
         continue;
       }
+      // WhatsApp silently drops group statuses in Community-linked groups. The
+      // operator chose to reach those groups with an ordinary group message.
+      const fallbackMessage = statusMode && Boolean(recipient.communityParentJid);
       // New groups get a grace period before their first campaign send, and
       // every group honors a cooldown since its last campaign send. The target
       // is parked as WAITING with a future scheduledAt; the pick filter above
@@ -1024,8 +1039,12 @@ export class CampaignService {
       if (!parkedRow && recipient.joinedAt && Number.isFinite(Date.parse(recipient.joinedAt))) {
         blockedUntilMs = Math.max(blockedUntilMs, Date.parse(recipient.joinedAt) + drawGroupGraceMs());
       }
-      const lastSendAt = statusMode ? recipient.lastStatusSentAt : recipient.lastCampaignSentAt;
-      const lastSendMs = lastSendAt && Number.isFinite(Date.parse(lastSendAt)) ? Date.parse(lastSendAt) : 0;
+      // A Community fallback is a normal group message, so it must respect the
+      // message cooldown as well as the status cadence.
+      const lastSendCandidates = fallbackMessage
+        ? [recipient.lastStatusSentAt, recipient.lastCampaignSentAt]
+        : [statusMode ? recipient.lastStatusSentAt : recipient.lastCampaignSentAt];
+      const lastSendMs = Math.max(0, ...lastSendCandidates.map((value) => value && Number.isFinite(Date.parse(value)) ? Date.parse(value) : 0));
       const cooldownMinMs = (statusMode ? STATUS_GROUP_COOLDOWN.minHours : GROUP_COOLDOWN.minHours) * 3_600_000;
       if (lastSendMs > 0 && lastSendMs + cooldownMinMs > Date.now()) {
         blockedUntilMs = Math.max(blockedUntilMs, lastSendMs + (statusMode ? drawStatusGroupCooldownMs() : drawGroupCooldownMs()));
@@ -1082,7 +1101,8 @@ export class CampaignService {
           const source = sources[Math.floor(Math.random() * sources.length)];
           const content = await this.statusContentFromPayload(source.payload);
           const sent = await this.enqueueAccountSend(async () => {
-            await this.whatsapp.sendGroupStatus(target.groupJid, content);
+            if (fallbackMessage) await this.sendFallbackMessage(socket, target.groupJid, content);
+            else await this.whatsapp.sendGroupStatus(target.groupJid, content);
           }, this.pacing.minSendGapSeconds * 1_000, id);
           if (!sent) { await this.releaseInterruptedTarget(id, target.id); return; }
           await wait(this.pacing.sendGapSeconds() * 1_000);
@@ -1147,7 +1167,11 @@ export class CampaignService {
         await db.update(campaignTargets).set({ status: 'SENT', sentAt, errorMessage: null })
           .where(and(eq(campaignTargets.id, target.id), ne(campaignTargets.status, 'SENT')));
         if (statusMode) {
-          await db.update(groups).set({ lastStatusSentAt: sentAt, updatedAt: sentAt }).where(and(eq(groups.accountId, this.accountId), eq(groups.whatsappGroupJid, target.groupJid)));
+          await db.update(groups).set({
+            lastStatusSentAt: sentAt,
+            ...(fallbackMessage ? { lastCampaignSentAt: sentAt } : {}),
+            updatedAt: sentAt,
+          }).where(and(eq(groups.accountId, this.accountId), eq(groups.whatsappGroupJid, target.groupJid)));
         } else {
           await db.update(groups).set({ lastCampaignSentAt: sentAt, updatedAt: sentAt }).where(and(eq(groups.accountId, this.accountId), eq(groups.whatsappGroupJid, target.groupJid)));
         }
