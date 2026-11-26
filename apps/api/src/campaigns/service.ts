@@ -6,6 +6,7 @@ import sharp from 'sharp';
 import { db } from '../db/client.js';
 import { campaignSources, campaignTargets, campaigns, groups, operationalLogs, sourceMessages } from '../db/schema.js';
 import type { WhatsAppManager, WhatsAppStatus } from '../whatsapp/manager.js';
+import { GROUP_STATUS_VIDEO_SUPPORTED } from '../whatsapp/group-status.js';
 import { CIRCUIT_BREAKER_CONSECUTIVE_FAILURES, drawCampaignWarmupSeconds, drawGroupCooldownMs, drawGroupGraceMs, drawReconnectSettleSeconds, drawSendGapSeconds, GROUP_COOLDOWN, millisecondsUntilDailyBudgetResets, millisecondsUntilSendWindowOpens, recordSend, SEND_DAILY_LIMIT, SEND_GAP, sendsToday } from '../safety/limits.js';
 import { canDeliverTarget, cooldownWarnings, type CampaignSchedule, validateExplicitTargets, validateSchedule } from './policy.js';
 
@@ -64,7 +65,7 @@ export type ManualSourceInput = {
   files?: unknown; // Array<{ kind: 'image'|'video'; dataUrl: unknown; caption?: unknown; name?: unknown }>
   updateSourceIds?: unknown; // keep existing sources, only refresh their caption/text
 };
-export type CampaignInput = { name: unknown; sourceMessageId: unknown; sourceMessageIds?: unknown; groupJids: unknown; schedule?: unknown; dailyRunTime?: unknown; autoAddJoinedGroups?: unknown; shuffleOrder?: unknown };
+export type CampaignInput = { name: unknown; sourceMessageId: unknown; sourceMessageIds?: unknown; groupJids: unknown; schedule?: unknown; dailyRunTime?: unknown; autoAddJoinedGroups?: unknown; shuffleOrder?: unknown; deliveryMode?: unknown; targetAllGroups?: unknown };
 
 /** Everything validated from a CampaignInput except the per-account target subset. */
 export type CampaignPlan = {
@@ -74,6 +75,8 @@ export type CampaignPlan = {
   schedule: CampaignSchedule;
   autoAddJoinedGroups: boolean;
   shuffleOrder: boolean;
+  deliveryMode: 'MESSAGE' | 'GROUP_STATUS';
+  targetAllGroups: boolean;
 };
 
 export type CampaignShardOptions = {
@@ -101,6 +104,21 @@ function autoAddJoinedGroupsFrom(value: unknown): boolean {
 function shuffleOrderFrom(value: unknown): boolean {
   if (value === undefined) return true;
   if (typeof value !== 'boolean') throw new Error('Shuffle recipient order must be true or false.');
+  return value;
+}
+
+function deliveryModeFrom(value: unknown): 'MESSAGE' | 'GROUP_STATUS' {
+  if (value === undefined) return 'MESSAGE';
+  if (value === 'MESSAGE' || value === 'GROUP_STATUS') return value;
+  throw new Error('deliveryMode must be MESSAGE or GROUP_STATUS.');
+}
+
+function targetAllGroupsFrom(value: unknown, deliveryMode: 'MESSAGE' | 'GROUP_STATUS'): boolean {
+  if (value === undefined) return false;
+  if (typeof value !== 'boolean') throw new Error('targetAllGroups must be true or false.');
+  if (value && deliveryMode !== 'GROUP_STATUS') {
+    throw new Error('targetAllGroups is only available for group-status campaigns.');
+  }
   return value;
 }
 
@@ -394,6 +412,29 @@ export class CampaignService {
     if (ids.some((id) => !known.has(id))) throw new Error('The selected manual source message was not found.');
   }
 
+  /** Every non-excluded group on this account, for a targetAllGroups plan. */
+  private async allNonExcludedGroupJids(): Promise<string[]> {
+    const rows = await db.select({ jid: groups.whatsappGroupJid }).from(groups)
+      .where(and(eq(groups.accountId, this.accountId), eq(groups.isExcluded, false)));
+    if (rows.length === 0) throw new Error('No groups are available on this account.');
+    return rows.map((row) => row.jid);
+  }
+
+  /** A group status is one text or caption of at most 1,024 characters; video is gated by the spike. */
+  private async assertStatusSources(ids: string[], sourceAccountId: string): Promise<void> {
+    const rows = await db.select({ payload: sourceMessages.payload }).from(sourceMessages)
+      .where(and(eq(sourceMessages.accountId, sourceAccountId), inArray(sourceMessages.id, ids)));
+    if (rows.length !== ids.length) throw new Error('The selected manual source message was not found.');
+    for (const row of rows) {
+      const content = JSON.parse(row.payload) as { text?: unknown; caption?: unknown; videoDataUrl?: unknown };
+      const text = typeof content.text === 'string' ? content.text : typeof content.caption === 'string' ? content.caption : '';
+      if (text.length > 1024) throw new Error('A group status can contain at most 1024 characters.');
+      if (typeof content.videoDataUrl === 'string' && !GROUP_STATUS_VIDEO_SUPPORTED) {
+        throw new Error('Group-status video is not supported yet; use text or an image.');
+      }
+    }
+  }
+
   /** Replace the campaign's ordered source list only when it actually changed.
    *  These rows are not delivery state: work() reads them at send time, so
    *  deleting and re-inserting them during a live edit is safe. */
@@ -417,12 +458,15 @@ export class CampaignService {
    */
   public async plan(input: CampaignInput, sourceAccountId = this.accountId): Promise<CampaignPlan> {
     const name = validText(input.name, 'name', 120);
+    const deliveryMode = deliveryModeFrom(input.deliveryMode);
+    const targetAllGroups = targetAllGroupsFrom(input.targetAllGroups, deliveryMode);
     const sourceIds = await this.resolveSourceMessageIds(input.sourceMessageIds, input.sourceMessageId, sourceAccountId);
-    const groupJids = validateExplicitTargets(input.groupJids);
+    const groupJids = targetAllGroups ? await this.allNonExcludedGroupJids() : validateExplicitTargets(input.groupJids);
     const autoAddJoinedGroups = autoAddJoinedGroupsFrom(input.autoAddJoinedGroups);
     const shuffleOrder = shuffleOrderFrom(input.shuffleOrder);
+    if (deliveryMode === 'GROUP_STATUS') await this.assertStatusSources(sourceIds, sourceAccountId);
     const schedule = input.schedule === undefined && input.dailyRunTime ? validateSchedule({ type: 'DAILY', time: input.dailyRunTime }) : validateSchedule(input.schedule);
-    return { name, sourceIds, groupJids, schedule, autoAddJoinedGroups, shuffleOrder };
+    return { name, sourceIds, groupJids, schedule, autoAddJoinedGroups, shuffleOrder, deliveryMode, targetAllGroups };
   }
 
   private async selectTargets(groupJids: string[]) {

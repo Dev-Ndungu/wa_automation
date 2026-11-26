@@ -769,3 +769,51 @@ test('the daily send cap allows exactly SEND_DAILY_LIMIT sends and refuses the n
   await db.delete(actionLog).where(inArray(actionLog.id, seeded));
   await clearSends();
 });
+
+test('a status campaign expands targetAllGroups to non-excluded groups', async () => {
+  await db.update(groups).set({ isExcluded: true });
+  await insertGroup('all-one@g.us', 'All one');
+  await insertGroup('all-excluded@g.us', 'All excluded');
+  await db.update(groups).set({ isExcluded: true }).where(eq(groups.whatsappGroupJid, 'all-excluded@g.us'));
+  const captured = await service.captureManualSource({ text: 'All groups status', label: 'All groups status' });
+  const plan = await service.plan({
+    name: 'All groups status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: [], deliveryMode: 'GROUP_STATUS', targetAllGroups: true,
+  } as never);
+  assert.deepEqual(plan.groupJids.sort(), ['all-one@g.us']);
+  assert.equal(plan.deliveryMode, 'GROUP_STATUS');
+  assert.equal(plan.targetAllGroups, true);
+});
+
+test('targetAllGroups is rejected for a message campaign', async () => {
+  const captured = await service.captureManualSource({ text: 'Message source', label: 'Message source' });
+  await assert.rejects(
+    () => service.plan({
+      name: 'Bad', sourceMessageIds: [captured.sources[0].id],
+      groupJids: ['all-one@g.us'], deliveryMode: 'MESSAGE', targetAllGroups: true,
+    } as never),
+    /only available for group-status/,
+  );
+});
+
+test('an unknown delivery mode is rejected', async () => {
+  const captured = await service.captureManualSource({ text: 'Mode source', label: 'Mode source' });
+  await assert.rejects(
+    () => service.plan({
+      name: 'Bad', sourceMessageIds: [captured.sources[0].id],
+      groupJids: ['all-one@g.us'], deliveryMode: 'STATUS',
+    } as never),
+    /deliveryMode must be MESSAGE or GROUP_STATUS/,
+  );
+});
+
+test('a status campaign rejects text over 1024 characters', async () => {
+  const captured = await service.captureManualSource({ text: 'x'.repeat(1025), label: 'Long status' });
+  await assert.rejects(
+    () => service.plan({
+      name: 'Long status', sourceMessageIds: [captured.sources[0].id],
+      groupJids: ['all-one@g.us'], deliveryMode: 'GROUP_STATUS',
+    } as never),
+    /at most 1024/,
+  );
+});
