@@ -56,6 +56,9 @@ export async function bootstrapDatabase(): Promise<void> {
   if (!(await hasColumn('groups', 'joined_at'))) {
     await db.run(sql`ALTER TABLE groups ADD COLUMN joined_at text`);
   }
+  if (!(await hasColumn('groups', 'last_status_sent_at'))) {
+    await db.run(sql`ALTER TABLE groups ADD COLUMN last_status_sent_at text`);
+  }
   await db.run(sql`CREATE TABLE IF NOT EXISTS discovered_links (id text PRIMARY KEY NOT NULL, account_id text NOT NULL REFERENCES whatsapp_accounts(id) ON DELETE CASCADE, invite_url text NOT NULL, invite_code text NOT NULL, source_group_jid text NOT NULL, source_group_name text NOT NULL, first_seen_at text NOT NULL, last_seen_at text NOT NULL, times_seen integer NOT NULL DEFAULT 1, source_message_id text, status text NOT NULL DEFAULT 'NEW', notes text, UNIQUE(account_id, invite_url))`);
   await db.run(sql`CREATE TABLE IF NOT EXISTS link_occurrences (id text PRIMARY KEY NOT NULL, link_id text NOT NULL REFERENCES discovered_links(id) ON DELETE CASCADE, source_group_jid text NOT NULL, occurred_at text NOT NULL)`);
   await db.run(sql`CREATE TABLE IF NOT EXISTS source_messages (id text PRIMARY KEY NOT NULL, account_id text NOT NULL REFERENCES whatsapp_accounts(id) ON DELETE CASCADE, chat_jid text NOT NULL, message_id text NOT NULL, payload text NOT NULL, preview text NOT NULL, created_at text NOT NULL, UNIQUE(account_id, chat_jid, message_id))`);
@@ -94,13 +97,13 @@ export async function bootstrapDatabase(): Promise<void> {
   if (!campaignColumns.some((column) => column.name === 'source_account_id')) {
     await db.run(sql`ALTER TABLE campaigns ADD COLUMN source_account_id text`);
   }
-  await db.run(sql`CREATE INDEX IF NOT EXISTS campaigns_distribution ON campaigns (distribution_id)`);
-  // Group-status delivery has been removed. A build from that period may have
-  // left campaigns targeting it; park them instead of sending their source as
-  // a group message behind the operator's back.
-  if (campaignColumns.some((column) => column.name === 'delivery_mode')) {
-    await db.run(sql`UPDATE campaigns SET status = 'PAUSED', pause_reason = 'Group-status delivery was removed, so this campaign now sends as a normal group message. Review it before starting.', delivery_mode = 'MESSAGE' WHERE delivery_mode = 'GROUP_STATUS' AND status IN ('DRAFT', 'QUEUED', 'RUNNING', 'PAUSED')`);
+  if (!campaignColumns.some((column) => column.name === 'delivery_mode')) {
+    await db.run(sql`ALTER TABLE campaigns ADD COLUMN delivery_mode text NOT NULL DEFAULT 'MESSAGE'`);
   }
+  if (!campaignColumns.some((column) => column.name === 'target_all_groups')) {
+    await db.run(sql`ALTER TABLE campaigns ADD COLUMN target_all_groups integer NOT NULL DEFAULT false`);
+  }
+  await db.run(sql`CREATE INDEX IF NOT EXISTS campaigns_distribution ON campaigns (distribution_id)`);
   await db.run(sql`CREATE TABLE IF NOT EXISTS campaign_targets (id text PRIMARY KEY NOT NULL, campaign_id text NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE, group_jid text NOT NULL, group_name text NOT NULL, position integer NOT NULL, status text NOT NULL DEFAULT 'QUEUED', scheduled_at text, sent_at text, error_message text, attempt_count integer NOT NULL DEFAULT 0, UNIQUE(campaign_id, group_jid))`);
   await db.run(sql`CREATE TABLE IF NOT EXISTS campaign_sources (id text PRIMARY KEY NOT NULL, campaign_id text NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE, source_message_id text NOT NULL REFERENCES source_messages(id) ON DELETE CASCADE, position integer NOT NULL, created_at text NOT NULL, UNIQUE(campaign_id, source_message_id))`);
   await db.run(sql`CREATE TABLE IF NOT EXISTS operational_logs (id text PRIMARY KEY NOT NULL, level text NOT NULL, event text NOT NULL, details text, created_at text NOT NULL)`);

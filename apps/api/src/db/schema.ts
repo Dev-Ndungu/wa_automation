@@ -43,6 +43,7 @@ export const groups = sqliteTable('groups', {
   isScannerEnabled: integer('is_scanner_enabled', { mode: 'boolean' }).notNull().default(true),
   isExcluded: integer('is_excluded', { mode: 'boolean' }).notNull().default(false),
   lastCampaignSentAt: text('last_campaign_sent_at'),
+  lastStatusSentAt: text('last_status_sent_at'),
   lastSyncedAt: text('last_synced_at'),
   joinedAt: text('joined_at'),
   ...timestamps,
@@ -99,6 +100,8 @@ export const campaigns = sqliteTable('campaigns', {
   // messages stay owned by the account that captured them.
   distributionId: text('distribution_id'),
   sourceAccountId: text('source_account_id'),
+  deliveryMode: text('delivery_mode', { enum: ['MESSAGE', 'GROUP_STATUS'] }).notNull().default('MESSAGE'),
+  targetAllGroups: integer('target_all_groups', { mode: 'boolean' }).notNull().default(false),
   // When set, the campaign was auto-paused on the daily send budget and resumes
   // itself at this time (the next UTC midnight, when the budget refills).
   autoResumeAt: text('auto_resume_at'),
