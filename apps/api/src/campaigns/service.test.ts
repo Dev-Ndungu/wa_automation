@@ -23,9 +23,10 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { rmSync } from 'node:fs';
 import test, { after, before } from 'node:test';
-import { eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import type { FastifyBaseLogger } from 'fastify';
-import { actionLog, campaignSources, campaignTargets, campaigns, groups, operationalLogs, sourceMessages } from '../db/schema.js';
+import { actionLog, campaignSources, campaignTargets, campaigns, groups, operationalLogs, sourceMessages, whatsappAccounts } from '../db/schema.js';
+import { combineCampaignShards } from './coordinator.js';
 import type { WhatsAppManager, WhatsAppStatus } from '../whatsapp/manager.js';
 
 const TINY_PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
@@ -81,11 +82,11 @@ after(() => {
   }
 });
 
-async function insertGroup(jid: string, name: string, extra?: { joinedAt?: string | null; lastCampaignSentAt?: string | null }): Promise<void> {
+async function insertGroup(jid: string, name: string, extra?: { joinedAt?: string | null; lastCampaignSentAt?: string | null }, accountId = 'main'): Promise<void> {
   const timestamp = new Date().toISOString();
   await db.insert(groups).values({
     id: randomUUID(),
-    accountId: 'main',
+    accountId,
     whatsappGroupJid: jid,
     name,
     description: null,
@@ -97,12 +98,12 @@ async function insertGroup(jid: string, name: string, extra?: { joinedAt?: strin
   });
 }
 
-async function waitForTargetsSent(campaignId: string, timeoutMs = 10_000): Promise<void> {
+async function waitForTargetsSent(campaignId: string, timeoutMs = 10_000, expectedTargets = 2): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const rows = await db.select({ status: campaignTargets.status }).from(campaignTargets)
       .where(eq(campaignTargets.campaignId, campaignId));
-    if (rows.length === 2 && rows.every((row) => row.status === 'SENT')) return;
+    if (rows.length === expectedTargets && rows.every((row) => row.status === 'SENT')) return;
     if (Date.now() >= deadline) {
       assert.fail(`campaign ${campaignId} targets did not reach SENT within ${timeoutMs}ms. Current statuses: ${JSON.stringify(rows)}`);
     }
@@ -211,6 +212,35 @@ test('multi-file capture sends image, video, image in order to every target', as
     assert.equal(sentCalls[base + 2].jid, jid);
     assert.ok(Buffer.isBuffer(sentCalls[base + 2].content.image), `call ${base + 2} must carry an image Buffer`);
   }
+});
+
+test('distributed shards share the owner source and combine into one card', async () => {
+  const secondAccountId = `second-${randomUUID()}`;
+  const timestamp = new Date().toISOString();
+  await db.insert(whatsappAccounts).values({ id: secondAccountId, name: `Second ${secondAccountId}`, phone: null, createdAt: timestamp, updatedAt: timestamp });
+  await insertGroup('split-a@g.us', 'Split A');
+  await insertGroup('split-b@g.us', 'Split B', undefined, secondAccountId);
+
+  const captured = await service.captureManualSource({ text: 'Split caption', label: 'Split' });
+  const plan = await service.plan({
+    name: 'Split campaign',
+    sourceMessageId: undefined,
+    sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['split-a@g.us', 'split-b@g.us'],
+    schedule: { type: 'ONCE' },
+  });
+  const second = new CampaignService(whatsappStub, loggerStub, secondAccountId);
+  const firstShard = await service.createFromPlan(plan, ['split-a@g.us'], { distributionId: 'distribution-1', sourceAccountId: 'main' });
+  const secondShard = await second.createFromPlan(plan, ['split-b@g.us'], { distributionId: 'distribution-1', sourceAccountId: 'main' });
+
+  assert.equal(firstShard.distributionId, 'distribution-1');
+  assert.equal(secondShard.sourceContent?.text, 'Split caption', 'a shard can read the owner source without duplicating it');
+  const combined = combineCampaignShards(
+    [firstShard, secondShard] as never,
+    new Map([['main', 'Main'], [secondAccountId, 'Second']]),
+  );
+  assert.equal(combined.targets.length, 2);
+  assert.deepEqual(combined.accounts.map((account) => account.name), ['Main', 'Second']);
 });
 
 test('campaign list stays lightweight while the detail keeps the editable source', async () => {
@@ -419,12 +449,8 @@ test('daily send budget pauses the campaign before any message goes out', async 
   // campaign back to RUNNING and the held message goes out without a resume
   // call from anyone.
   await db.delete(actionLog).where(inArray(actionLog.id, budgetRowIds));
-  await waitForCampaignStatus(campaign.id, 'RUNNING');
-  const [resumed] = await db.select({ pauseReason: campaigns.pauseReason, autoResumeAt: campaigns.autoResumeAt })
-    .from(campaigns).where(eq(campaigns.id, campaign.id));
-  assert.equal(resumed.pauseReason, null, 'an auto-resumed campaign must not keep its pause reason');
-  assert.equal(resumed.autoResumeAt, null, 'an auto-resumed campaign must not keep its resume deadline');
-
+  // The resumed campaign can deliver and complete before a poll observes the
+  // brief RUNNING state, so wait for the held message instead of that state.
   const deadline = Date.now() + 5_000;
   for (;;) {
     const [target] = await db.select({ status: campaignTargets.status }).from(campaignTargets).where(eq(campaignTargets.campaignId, campaign.id));
@@ -432,6 +458,11 @@ test('daily send budget pauses the campaign before any message goes out', async 
     if (Date.now() >= deadline) assert.fail(`the auto-resumed campaign did not deliver; target status: ${target.status}`);
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
+  const [resumed] = await db.select({ status: campaigns.status, pauseReason: campaigns.pauseReason, autoResumeAt: campaigns.autoResumeAt })
+    .from(campaigns).where(eq(campaigns.id, campaign.id));
+  assert.ok(['RUNNING', 'COMPLETED'].includes(resumed.status), `an auto-resumed campaign must be live or complete, not ${resumed.status}`);
+  assert.equal(resumed.pauseReason, null, 'an auto-resumed campaign must not keep its pause reason');
+  assert.equal(resumed.autoResumeAt, null, 'an auto-resumed campaign must not keep its resume deadline');
   assert.equal(sentCalls.length, 1, 'exactly the held message goes out after the budget resets');
 
   const resumeLogs = await db.select({ event: operationalLogs.event, details: operationalLogs.details }).from(operationalLogs)
@@ -692,4 +723,49 @@ test('circuit breaker pauses every running campaign after consecutive send failu
   assert.equal(breakerService.getCircuitWarning(), null, 'an operator Run now must clear the account warning');
   const [stillPausedB] = await db.select({ status: campaigns.status }).from(campaigns).where(eq(campaigns.id, campaignB.id));
   assert.equal(stillPausedB.status, 'PAUSED', 'running one campaign again must not resume the others');
+});
+
+test('the daily send cap allows exactly SEND_DAILY_LIMIT sends and refuses the next', async () => {
+  // Prove the boundary rather than just "at the limit": with one send still
+  // available the message must go out, and the very next one must be refused.
+  const clearSends = () => db.delete(actionLog)
+    .where(and(eq(actionLog.accountId, 'main'), eq(actionLog.action, 'SEND')));
+  await clearSends();
+  const at = new Date().toISOString();
+  const seeded: string[] = [];
+  const rows = Array.from({ length: SEND_DAILY_LIMIT - 1 }, () => {
+    const id = randomUUID();
+    seeded.push(id);
+    return { id, accountId: 'main', action: 'SEND' as const, createdAt: at };
+  });
+  await db.insert(actionLog).values(rows);
+
+  const lastAllowedJid = `cap-last-${randomUUID()}@g.us`;
+  const blockedJid = `cap-blocked-${randomUUID()}@g.us`;
+  await insertGroup(lastAllowedJid, 'Cap last');
+  await insertGroup(blockedJid, 'Cap blocked');
+  const captured = await service.captureManualSource({ text: 'Cap probe', label: 'Cap' });
+
+  // Send #SEND_DAILY_LIMIT: one slot left, so this must be delivered.
+  const allowed = await service.create({
+    name: 'Cap allowed', sourceMessageId: undefined, sourceMessageIds: [captured.sources[0].id],
+    groupJids: [lastAllowedJid], schedule: { type: 'ONCE' }, shuffleOrder: false,
+  });
+  sentCalls.length = 0;
+  await service.runNow(allowed.id);
+  await waitForTargetsSent(allowed.id, 10_000, 1);
+  assert.deepEqual(sentCalls.map((call) => call.jid), [lastAllowedJid], 'the send that fills the cap must still be delivered');
+
+  // The delivered send recorded itself, so the budget is now exactly full.
+  const blocked = await service.create({
+    name: 'Cap blocked', sourceMessageId: undefined, sourceMessageIds: [captured.sources[0].id],
+    groupJids: [blockedJid], schedule: { type: 'ONCE' }, shuffleOrder: false,
+  });
+  sentCalls.length = 0;
+  await service.runNow(blocked.id);
+  await waitForPause(blocked.id);
+  assert.equal(sentCalls.length, 0, 'the send after the cap must never be delivered');
+
+  await db.delete(actionLog).where(inArray(actionLog.id, seeded));
+  await clearSends();
 });

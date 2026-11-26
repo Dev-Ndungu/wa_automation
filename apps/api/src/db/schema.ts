@@ -95,6 +95,10 @@ export const campaigns = sqliteTable('campaigns', {
   autoAddJoinedGroups: integer('auto_add_joined_groups', { mode: 'boolean' }).notNull().default(false),
   shuffleOrder: integer('shuffle_order', { mode: 'boolean' }).notNull().default(true),
   pauseReason: text('pause_reason'),
+  // Campaigns split across accounts share one distribution id; the source
+  // messages stay owned by the account that captured them.
+  distributionId: text('distribution_id'),
+  sourceAccountId: text('source_account_id'),
   // When set, the campaign was auto-paused on the daily send budget and resumes
   // itself at this time (the next UTC midnight, when the budget refills).
   autoResumeAt: text('auto_resume_at'),

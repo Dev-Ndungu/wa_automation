@@ -13,7 +13,7 @@ const { JoinQueueService } = await import('./service.js');
 
 import assert from 'node:assert/strict';
 import { rmSync } from 'node:fs';
-import test, { after, before } from 'node:test';
+import test, { after, before, mock } from 'node:test';
 import { eq } from 'drizzle-orm';
 import type { FastifyBaseLogger } from 'fastify';
 import { joinQueue } from '../db/schema.js';
@@ -50,6 +50,17 @@ async function clearTables(): Promise<void> {
   await db.delete(joinQueue);
 }
 
+// Joins are gated to 06:00-23:00 East Africa Time. Pin the clock inside that
+// window so the suite behaves the same at any hour it is run.
+async function duringJoinWindow(run: () => Promise<void>): Promise<void> {
+  mock.timers.enable({ apis: ['Date'], now: new Date('2026-06-15T09:00:00+03:00') });
+  try {
+    await run();
+  } finally {
+    mock.timers.reset();
+  }
+}
+
 test('enqueue parses pasted text, normalises and dedupes links', async () => {
   await clearTables();
   const joinedCodes: string[] = [];
@@ -74,17 +85,19 @@ test('enqueue skips links that are already queued', async () => {
 });
 
 test('processNextDue joins one due item and marks it JOINED', async () => {
-  await clearTables();
-  const joinedCodes: string[] = [];
-  const service = new JoinQueueService(whatsappStub('CONNECTED', joinedCodes), loggerStub);
-  await service.enqueue({ links: ['https://chat.whatsapp.com/AbcD_12345'] });
-  await service.processNextDue();
-  assert.deepEqual(joinedCodes, ['AbcD_12345']);
-  const rows = await db.select().from(joinQueue).where(eq(joinQueue.inviteCode, 'AbcD_12345'));
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].status, 'JOINED');
-  assert.equal(rows[0].groupJid, 'AbcD_12345@g.us');
-  assert.ok(rows[0].joinedAt);
+  await duringJoinWindow(async () => {
+    await clearTables();
+    const joinedCodes: string[] = [];
+    const service = new JoinQueueService(whatsappStub('CONNECTED', joinedCodes), loggerStub);
+    await service.enqueue({ links: ['https://chat.whatsapp.com/AbcD_12345'] });
+    await service.processNextDue();
+    assert.deepEqual(joinedCodes, ['AbcD_12345']);
+    const rows = await db.select().from(joinQueue).where(eq(joinQueue.inviteCode, 'AbcD_12345'));
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].status, 'JOINED');
+    assert.equal(rows[0].groupJid, 'AbcD_12345@g.us');
+    assert.ok(rows[0].joinedAt);
+  });
 });
 
 test('processNextDue leaves items queued while the account is disconnected', async () => {

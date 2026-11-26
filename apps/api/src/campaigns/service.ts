@@ -66,6 +66,21 @@ export type ManualSourceInput = {
 };
 export type CampaignInput = { name: unknown; sourceMessageId: unknown; sourceMessageIds?: unknown; groupJids: unknown; schedule?: unknown; dailyRunTime?: unknown; autoAddJoinedGroups?: unknown; shuffleOrder?: unknown };
 
+/** Everything validated from a CampaignInput except the per-account target subset. */
+export type CampaignPlan = {
+  name: string;
+  sourceIds: string[];
+  groupJids: string[];
+  schedule: CampaignSchedule;
+  autoAddJoinedGroups: boolean;
+  shuffleOrder: boolean;
+};
+
+export type CampaignShardOptions = {
+  distributionId?: string | null;
+  sourceAccountId?: string | null;
+};
+
 export type CapturedSource = { id: string; kind: 'text' | 'image' | 'video'; preview: string };
 
 type PreparedImage = { dataUrl: string; image: Buffer; jpegThumbnail: Buffer; width?: number; height?: number };
@@ -343,11 +358,11 @@ export class CampaignService {
   /** Resolve the ordered source-message list for a campaign input. The new
    *  multi-file field wins when both are present; the legacy single ID is the
    *  fallback. Every referenced message must exist for this account. */
-  private async resolveSourceMessageIds(sourceMessageIds: unknown, sourceMessageId: unknown): Promise<string[]> {
-    if (sourceMessageIds !== undefined) return this.resolveSourceMessageIdList(sourceMessageIds, 'sourceMessageIds');
+  private async resolveSourceMessageIds(sourceMessageIds: unknown, sourceMessageId: unknown, sourceAccountId = this.accountId): Promise<string[]> {
+    if (sourceMessageIds !== undefined) return this.resolveSourceMessageIdList(sourceMessageIds, 'sourceMessageIds', sourceAccountId);
     if (sourceMessageId === undefined) throw new Error('A campaign needs at least one source message.');
     const single = validText(sourceMessageId, 'sourceMessageId', 128);
-    await this.assertSourceMessagesExist([single]);
+    await this.assertSourceMessagesExist([single], sourceAccountId);
     return [single];
   }
 
@@ -355,7 +370,7 @@ export class CampaignService {
    *  at most 10 non-empty trimmed strings, no duplicates, and every message
    *  existing for this account. Shared by the campaign input and the manual
    *  capture update path, each with its own field name in error messages. */
-  private async resolveSourceMessageIdList(value: unknown, field: string): Promise<string[]> {
+  private async resolveSourceMessageIdList(value: unknown, field: string, sourceAccountId = this.accountId): Promise<string[]> {
     if (!Array.isArray(value)) throw new Error(`${field} must be an array of source message IDs.`);
     const ids = value as unknown[];
     if (ids.length === 0) throw new Error('A campaign needs at least one source message.');
@@ -368,13 +383,13 @@ export class CampaignService {
       trimmed.push(entry.trim());
     }
     if (new Set(trimmed).size !== trimmed.length) throw new Error('Each source message can be selected only once.');
-    await this.assertSourceMessagesExist(trimmed);
+    await this.assertSourceMessagesExist(trimmed, sourceAccountId);
     return trimmed;
   }
 
-  private async assertSourceMessagesExist(ids: string[]): Promise<void> {
+  private async assertSourceMessagesExist(ids: string[], sourceAccountId = this.accountId): Promise<void> {
     const found = await db.select({ id: sourceMessages.id }).from(sourceMessages)
-      .where(and(eq(sourceMessages.accountId, this.accountId), inArray(sourceMessages.id, ids)));
+      .where(and(eq(sourceMessages.accountId, sourceAccountId), inArray(sourceMessages.id, ids)));
     const known = new Set(found.map((row) => row.id));
     if (ids.some((id) => !known.has(id))) throw new Error('The selected manual source message was not found.');
   }
@@ -395,28 +410,49 @@ export class CampaignService {
     }
   }
 
-  public async create(input: CampaignInput) {
+  /**
+   * Validate a campaign input once. The source messages are checked against
+   * the account that captured them, which may differ from the account that
+   * sends a distributed shard.
+   */
+  public async plan(input: CampaignInput, sourceAccountId = this.accountId): Promise<CampaignPlan> {
     const name = validText(input.name, 'name', 120);
-    const sourceIds = await this.resolveSourceMessageIds(input.sourceMessageIds, input.sourceMessageId);
+    const sourceIds = await this.resolveSourceMessageIds(input.sourceMessageIds, input.sourceMessageId, sourceAccountId);
     const groupJids = validateExplicitTargets(input.groupJids);
     const autoAddJoinedGroups = autoAddJoinedGroupsFrom(input.autoAddJoinedGroups);
     const shuffleOrder = shuffleOrderFrom(input.shuffleOrder);
     const schedule = input.schedule === undefined && input.dailyRunTime ? validateSchedule({ type: 'DAILY', time: input.dailyRunTime }) : validateSchedule(input.schedule);
+    return { name, sourceIds, groupJids, schedule, autoAddJoinedGroups, shuffleOrder };
+  }
 
+  private async selectTargets(groupJids: string[]) {
     const selectedGroups = await db.select({ jid: groups.whatsappGroupJid, name: groups.name, lastCampaignSentAt: groups.lastCampaignSentAt, isExcluded: groups.isExcluded })
       .from(groups).where(and(eq(groups.accountId, this.accountId), inArray(groups.whatsappGroupJid, groupJids)));
     const byJid = new Map(selectedGroups.map((group) => [group.jid, group]));
     const missing = groupJids.filter((jid) => !byJid.has(jid));
     if (missing.length) throw new Error('Every target must be a group synced from the linked WhatsApp account.');
     if (selectedGroups.some((group) => group.isExcluded)) throw new Error('Excluded groups cannot be included in a campaign. Remove the exclusion first if you want to use one.');
+    return { selectedGroups, byJid };
+  }
 
+  /** Insert one campaign row (a shard, when distributed) for a target subset. */
+  public async createFromPlan(plan: CampaignPlan, groupJids: string[], options: CampaignShardOptions = {}) {
+    const { selectedGroups, byJid } = await this.selectTargets(groupJids);
+    const sourceAccountId = options.sourceAccountId ?? this.accountId;
+    const distributionId = options.distributionId ?? null;
     const id = randomUUID();
     const createdAt = now();
     // The interval_seconds columns are legacy and inert: pacing is randomized
     // and built in (see safety/limits.ts). They stay because the columns are
     // NOT NULL without a default in the original bootstrap schema.
-    await db.insert(campaigns).values({ id, accountId: this.accountId, name, sourceMessageReference: sourceIds[0], status: 'DRAFT', intervalSeconds: 0, intervalSecondsList: '[0]', dailyRunTime: schedule.type === 'DAILY' ? schedule.time : null, nextRunAt: null, lastRunAt: null, scheduleConfig: JSON.stringify(schedule), autoAddJoinedGroups, shuffleOrder, createdAt, startedAt: null, completedAt: null });
-    for (const [position, sourceId] of sourceIds.entries()) {
+    await db.insert(campaigns).values({
+      id, accountId: this.accountId, distributionId, sourceAccountId,
+      name: plan.name, sourceMessageReference: plan.sourceIds[0], status: 'DRAFT', intervalSeconds: 0, intervalSecondsList: '[0]',
+      dailyRunTime: plan.schedule.type === 'DAILY' ? plan.schedule.time : null, nextRunAt: null, lastRunAt: null,
+      scheduleConfig: JSON.stringify(plan.schedule), autoAddJoinedGroups: plan.autoAddJoinedGroups, shuffleOrder: plan.shuffleOrder,
+      createdAt, startedAt: null, completedAt: null,
+    });
+    for (const [position, sourceId] of plan.sourceIds.entries()) {
       await db.insert(campaignSources).values({ id: randomUUID(), campaignId: id, sourceMessageId: sourceId, position, createdAt });
     }
     for (const [position, jid] of groupJids.entries()) {
@@ -424,6 +460,11 @@ export class CampaignService {
       await db.insert(campaignTargets).values({ id: randomUUID(), campaignId: id, groupJid: jid, groupName: group.name, position, status: 'QUEUED', scheduledAt: null, sentAt: null, errorMessage: null, attemptCount: 0 });
     }
     return { ...(await this.get(id)), warnings: cooldownWarnings(selectedGroups) };
+  }
+
+  public async create(input: CampaignInput) {
+    const plan = await this.plan(input);
+    return this.createFromPlan(plan, plan.groupJids);
   }
 
   public async list() {
@@ -444,7 +485,7 @@ export class CampaignService {
     })
       .from(campaignSources)
       .innerJoin(sourceMessages, eq(campaignSources.sourceMessageId, sourceMessages.id))
-      .where(and(inArray(campaignSources.campaignId, ids), eq(sourceMessages.accountId, this.accountId)))
+      .where(inArray(campaignSources.campaignId, ids))
       .orderBy(asc(campaignSources.campaignId), asc(campaignSources.position));
     const legacyIds = [...new Set(rows
       .filter((campaign) => !sourceRows.some((source) => source.campaignId === campaign.id))
@@ -454,7 +495,7 @@ export class CampaignService {
       prefix: sql<string>`substr(${sourceMessages.payload}, 1, 160)`,
       preview: sourceMessages.preview,
     }).from(sourceMessages)
-      .where(and(eq(sourceMessages.accountId, this.accountId), inArray(sourceMessages.id, legacyIds)));
+      .where(inArray(sourceMessages.id, legacyIds));
     const legacyById = new Map(legacyRows.map((row) => [row.id, row]));
 
     const targetJids = [...new Set(targetRows.map((target) => target.groupJid))];
@@ -495,6 +536,9 @@ export class CampaignService {
   public async get(id: string) {
     const [campaign] = await db.select().from(campaigns).where(and(eq(campaigns.id, id), eq(campaigns.accountId, this.accountId))).limit(1);
     if (!campaign) throw new Error('Campaign not found.');
+    // A distributed campaign's source messages stay owned by the account that
+    // captured them, even when a different account sends this shard.
+    const sourceAccountId = campaign.sourceAccountId ?? this.accountId;
     const targets = await db.select().from(campaignTargets).where(eq(campaignTargets.campaignId, id)).orderBy(asc(campaignTargets.position));
     // Read only a payload prefix plus the JSON text fields: selecting the full
     // payload pulled megabytes of base64 into Node for every campaign load.
@@ -508,7 +552,7 @@ export class CampaignService {
     const sourceRows = await db.select({ ...sourceFields, sourceMessageId: campaignSources.sourceMessageId })
       .from(campaignSources)
       .innerJoin(sourceMessages, eq(campaignSources.sourceMessageId, sourceMessages.id))
-      .where(and(eq(campaignSources.campaignId, id), eq(sourceMessages.accountId, this.accountId)))
+      .where(and(eq(campaignSources.campaignId, id), eq(sourceMessages.accountId, sourceAccountId)))
       .orderBy(asc(campaignSources.position));
     // Legacy campaigns (created before campaign_sources existed) have no rows;
     // fall back to the single source_message_reference entry.
@@ -519,7 +563,7 @@ export class CampaignService {
       first = sourceRows[0];
     } else {
       const [source] = await db.select(sourceFields).from(sourceMessages)
-        .where(and(eq(sourceMessages.id, campaign.sourceMessageReference), eq(sourceMessages.accountId, this.accountId))).limit(1);
+        .where(and(eq(sourceMessages.id, campaign.sourceMessageReference), eq(sourceMessages.accountId, sourceAccountId))).limit(1);
       if (source) {
         first = source;
         sources = [{ id: campaign.sourceMessageReference, kind: sourceKindFromPrefix(source.prefix), preview: source.preview }];
@@ -584,30 +628,31 @@ export class CampaignService {
 
   public async update(id: string, input: CampaignInput) {
     const campaign = await this.requireStatus(id, ['DRAFT', 'QUEUED', 'RUNNING', 'PAUSED', 'COMPLETED', 'STOPPED']);
-    const name = validText(input.name, 'name', 120);
-    const sourceIds = await this.resolveSourceMessageIds(input.sourceMessageIds, input.sourceMessageId);
-    const groupJids = validateExplicitTargets(input.groupJids);
-    const autoAddJoinedGroups = autoAddJoinedGroupsFrom(input.autoAddJoinedGroups);
-    const shuffleOrder = shuffleOrderFrom(input.shuffleOrder);
-    const schedule = input.schedule === undefined && input.dailyRunTime ? validateSchedule({ type: 'DAILY', time: input.dailyRunTime }) : validateSchedule(input.schedule);
-    const selectedGroups = await db.select({ jid: groups.whatsappGroupJid, name: groups.name, isExcluded: groups.isExcluded })
-      .from(groups).where(and(eq(groups.accountId, this.accountId), inArray(groups.whatsappGroupJid, groupJids)));
-    const byJid = new Map(selectedGroups.map((group) => [group.jid, group]));
-    if (groupJids.some((jid) => !byJid.has(jid))) throw new Error('Every target must be a group synced from the linked WhatsApp account.');
-    if (selectedGroups.some((group) => group.isExcluded)) throw new Error('Excluded groups cannot be included in a campaign. Remove the exclusion first if you want to use one.');
+    // Source messages are validated against the account that owns them, not
+    // necessarily the account sending this shard.
+    const plan = await this.plan(input, campaign.sourceAccountId ?? this.accountId);
+    return this.updateFromPlan(id, plan, plan.groupJids);
+  }
 
-    const scheduleConfig = JSON.stringify(schedule);
+  /** Apply a validated plan to one campaign row (a shard when distributed). */
+  public async updateFromPlan(id: string, plan: CampaignPlan, groupJids: string[], sourceAccountId?: string) {
+    const campaign = await this.requireStatus(id, ['DRAFT', 'QUEUED', 'RUNNING', 'PAUSED', 'COMPLETED', 'STOPPED']);
+    const sourceOwner = sourceAccountId ?? campaign.sourceAccountId ?? this.accountId;
+    const { byJid } = await this.selectTargets(groupJids);
+
+    const scheduleConfig = JSON.stringify(plan.schedule);
     const scheduleChanged = campaign.scheduleConfig !== scheduleConfig;
     const nextRunAt = campaign.status === 'RUNNING' && !scheduleChanged
       ? campaign.nextRunAt
-      : schedule.type === 'ONCE' ? null : nextScheduledRunAt(schedule);
+      : plan.schedule.type === 'ONCE' ? null : nextScheduledRunAt(plan.schedule);
     await db.update(campaigns).set({
-      name, sourceMessageReference: sourceIds[0], intervalSeconds: 0, intervalSecondsList: '[0]',
-      dailyRunTime: schedule.type === 'DAILY' ? schedule.time : null, scheduleConfig,
-      autoAddJoinedGroups, shuffleOrder, nextRunAt, lastRunAt: campaign.status === 'RUNNING' ? campaign.lastRunAt : null,
+      name: plan.name, sourceMessageReference: plan.sourceIds[0], intervalSeconds: 0, intervalSecondsList: '[0]',
+      dailyRunTime: plan.schedule.type === 'DAILY' ? plan.schedule.time : null, scheduleConfig, sourceAccountId: sourceOwner,
+      autoAddJoinedGroups: plan.autoAddJoinedGroups, shuffleOrder: plan.shuffleOrder, nextRunAt,
+      lastRunAt: campaign.status === 'RUNNING' ? campaign.lastRunAt : null,
       completedAt: campaign.status === 'COMPLETED' ? null : campaign.completedAt,
     }).where(eq(campaigns.id, id));
-    await this.syncCampaignSources(id, sourceIds);
+    await this.syncCampaignSources(id, plan.sourceIds);
     if (campaign.status === 'RUNNING') {
       // A live edit must never delete delivery history or a row currently
       // sending. New choices join the remaining queue; removed unsent rows are
@@ -722,7 +767,7 @@ export class CampaignService {
     const [eligible] = await db.select({ isExcluded: groups.isExcluded }).from(groups)
       .where(and(eq(groups.accountId, this.accountId), eq(groups.whatsappGroupJid, group.jid))).limit(1);
     if (!eligible || eligible.isExcluded) return;
-    const recipients = await db.select({ id: campaigns.id, status: campaigns.status }).from(campaigns).where(and(
+    const recipients = await db.select({ id: campaigns.id, status: campaigns.status, distributionId: campaigns.distributionId }).from(campaigns).where(and(
       eq(campaigns.accountId, this.accountId),
       eq(campaigns.autoAddJoinedGroups, true),
       inArray(campaigns.status, ['DRAFT', 'QUEUED', 'RUNNING', 'PAUSED']),
@@ -731,6 +776,13 @@ export class CampaignService {
       const existing = await db.select({ id: campaignTargets.id }).from(campaignTargets)
         .where(and(eq(campaignTargets.campaignId, campaign.id), eq(campaignTargets.groupJid, group.jid))).limit(1);
       if (existing.length) continue;
+      // A distributed campaign must send to a group once, not once per shard.
+      if (campaign.distributionId) {
+        const [shared] = await db.select({ id: campaignTargets.id }).from(campaignTargets)
+          .innerJoin(campaigns, eq(campaignTargets.campaignId, campaigns.id))
+          .where(and(eq(campaigns.distributionId, campaign.distributionId), eq(campaignTargets.groupJid, group.jid))).limit(1);
+        if (shared) continue;
+      }
       const rows = await db.select({ position: campaignTargets.position }).from(campaignTargets).where(eq(campaignTargets.campaignId, campaign.id)).orderBy(asc(campaignTargets.position));
       const position = (rows.at(-1)?.position ?? -1) + 1;
       await db.insert(campaignTargets).values({ id: randomUUID(), campaignId: campaign.id, groupJid: group.jid, groupName: group.name, position, status: 'QUEUED', scheduledAt: null, sentAt: null, errorMessage: null, attemptCount: 0 });
@@ -742,19 +794,19 @@ export class CampaignService {
   /** Ordered source payloads for delivery: campaign_sources rows by position,
    *  or the legacy single source_message_reference when no rows exist. Any
    *  missing referenced message is a hard error so the target fails cleanly. */
-  private async loadOrderedSourcesForSend(campaignId: string, fallbackReference: string): Promise<Array<{ id: string; payload: string }>> {
+  private async loadOrderedSourcesForSend(campaignId: string, fallbackReference: string, sourceAccountId = this.accountId): Promise<Array<{ id: string; payload: string }>> {
     const stored = await db.select({ sourceMessageId: campaignSources.sourceMessageId }).from(campaignSources)
       .where(eq(campaignSources.campaignId, campaignId)).orderBy(asc(campaignSources.position));
     if (stored.length) {
       const rows = await db.select({ id: sourceMessages.id, payload: sourceMessages.payload }).from(sourceMessages)
-        .where(and(eq(sourceMessages.accountId, this.accountId), inArray(sourceMessages.id, stored.map((row) => row.sourceMessageId))));
+        .where(and(eq(sourceMessages.accountId, sourceAccountId), inArray(sourceMessages.id, stored.map((row) => row.sourceMessageId))));
       const byId = new Map(rows.map((row) => [row.id, row]));
       const ordered = stored.map((row) => byId.get(row.sourceMessageId));
       if (ordered.some((row) => !row)) throw new Error('The campaign source message no longer exists.');
       return ordered as Array<{ id: string; payload: string }>;
     }
     const [source] = await db.select({ id: sourceMessages.id, payload: sourceMessages.payload }).from(sourceMessages)
-      .where(and(eq(sourceMessages.id, fallbackReference), eq(sourceMessages.accountId, this.accountId))).limit(1);
+      .where(and(eq(sourceMessages.id, fallbackReference), eq(sourceMessages.accountId, sourceAccountId))).limit(1);
     if (!source) throw new Error('The campaign source message no longer exists.');
     return [{ id: source.id, payload: source.payload }];
   }
@@ -894,7 +946,7 @@ export class CampaignService {
       // Hoisted so the catch below can use it if loading the sources throws.
       let sources: Array<{ id: string; payload: string }> = [];
       try {
-        sources = await this.loadOrderedSourcesForSend(id, campaign.sourceMessageReference);
+        sources = await this.loadOrderedSourcesForSend(id, campaign.sourceMessageReference, campaign.sourceAccountId ?? this.accountId);
         const socket = this.whatsapp.getSocket();
         if (!socket || this.whatsapp.getStatus().state !== 'CONNECTED') throw new Error('WhatsApp is not connected.');
         for (const source of sources) {

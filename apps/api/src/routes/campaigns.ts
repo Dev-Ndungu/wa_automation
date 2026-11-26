@@ -10,12 +10,15 @@ function idFrom(request: { params: unknown }): string {
 
 export function campaignRoutes(accounts: AccountService) {
   return async function routes(app: FastifyInstance): Promise<void> {
-    app.get('/api/campaigns', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.list());
-    app.get('/api/campaigns/:id', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.get(idFrom(request)));
+    // Campaigns are listed across every account: a campaign split between
+    // accounts appears as one card with combined progress.
+    app.get('/api/campaigns', async () => accounts.listCampaigns());
+    app.get('/api/campaigns/:id', async (request) => accounts.getCampaign(idFrom(request)));
     app.post('/api/campaigns/source-messages/manual', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.captureManualSource(request.body as never));
     app.post('/api/campaigns', async (request, reply) => {
       try {
-        return await (await accounts.get(accountIdFrom(request))).campaigns.create(request.body as never);
+        const account = await accounts.get(accountIdFrom(request));
+        return await accounts.createCampaign(account.id, request.body as never);
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Could not create the campaign.';
         return reply.code(400).send({ message });
@@ -23,18 +26,18 @@ export function campaignRoutes(accounts: AccountService) {
     });
     app.put('/api/campaigns/:id', async (request, reply) => {
       try {
-        return await (await accounts.get(accountIdFrom(request))).campaigns.update(idFrom(request), request.body as never);
+        return await accounts.updateCampaign(idFrom(request), request.body as never);
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Could not save campaign changes.';
         return reply.code(400).send({ message });
       }
     });
-    app.post('/api/campaigns/:id/start', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.start(idFrom(request)));
-    app.post('/api/campaigns/:id/run-now', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.runNow(idFrom(request)));
-    app.post('/api/campaigns/:id/pause', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.pause(idFrom(request)));
-    app.post('/api/campaigns/:id/resume', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.resume(idFrom(request)));
-    app.post('/api/campaigns/:id/stop', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.stop(idFrom(request)));
-    app.post('/api/campaigns/stop-all', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.stopAll());
-    app.delete('/api/campaigns/:id', async (request) => (await accounts.get(accountIdFrom(request))).campaigns.delete(idFrom(request)));
+    app.post('/api/campaigns/:id/start', async (request) => accounts.campaignAction(idFrom(request), 'start'));
+    app.post('/api/campaigns/:id/run-now', async (request) => accounts.campaignAction(idFrom(request), 'run-now'));
+    app.post('/api/campaigns/:id/pause', async (request) => accounts.campaignAction(idFrom(request), 'pause'));
+    app.post('/api/campaigns/:id/resume', async (request) => accounts.campaignAction(idFrom(request), 'resume'));
+    app.post('/api/campaigns/:id/stop', async (request) => accounts.campaignAction(idFrom(request), 'stop'));
+    app.post('/api/campaigns/stop-all', async () => accounts.stopAllCampaigns());
+    app.delete('/api/campaigns/:id', async (request) => accounts.campaignAction(idFrom(request), 'delete'));
   };
 }

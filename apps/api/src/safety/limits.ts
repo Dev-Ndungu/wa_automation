@@ -14,18 +14,19 @@ import { actionLog } from '../db/schema.js';
 
 /**
  * Random wait between consecutive group joins, drawn per join. Joining is the
- * single most restriction-sensitive action, so the floor is deliberately long:
- * a human would not join several groups minutes apart.
+ * single most restriction-sensitive action: a rapid run of joins is the classic
+ * way an account gets restricted, so the gap is measured in hours, not minutes.
  */
-export const JOIN_PACING = { minSeconds: 1_800, maxSeconds: 5_400 };
+export const JOIN_PACING = { minSeconds: 7_200, maxSeconds: 14_400 };
 
 /**
- * Hard caps on joins: a burst window and a per-day total. The burst window
- * mirrors the pacing floor — no two joins may land within 30 minutes of each
- * other — while the per-day total is the overall ceiling.
+ * Hard caps on joins: a burst window and a per-day total. The burst window is
+ * wider than the pacing floor, so at most one join lands in any five-hour span
+ * even if an operator submits several at once; the per-day total is the overall
+ * ceiling.
  */
-export const JOIN_BURST = { limit: 2, windowMinutes: 30 };
-export const JOIN_DAILY_LIMIT = 15;
+export const JOIN_BURST = { limit: 1, windowMinutes: 300 };
+export const JOIN_DAILY_LIMIT = 5;
 
 /** Random wait between consecutive message sends, drawn per message. */
 export const SEND_GAP = { minSeconds: 60, maxSeconds: 240 };
