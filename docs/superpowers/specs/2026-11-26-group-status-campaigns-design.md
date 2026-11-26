@@ -541,8 +541,9 @@ rendered in Test213456 (a normal, non-Community group; see §7.10). The first
 `messageSecret: 'none'` text was sent only into the Community-linked UOEM group
 and did not render there; that group cannot render any group status, so `'none'`
 is not conclusively tested and `'both'` remains the default. The 1,024-character
-limit was not independently verified. The 60-minute connection check was still
-running when the implementation review completed.
+limit was not independently verified. The 60-minute connection check passed:
+the session stayed connected with no `Stream Errored` or reconnect; the only
+close was the script's deliberate disconnect.
 
 ### 9.3 Rollout
 
