@@ -271,6 +271,9 @@ export class AccountService {
     const joins = new JoinQueueService(whatsapp, this.logger, accountId);
     const runtime = { id: accountId, scanner, whatsapp, campaigns, joins };
     this.runtimes.set(accountId, runtime);
+    // Queue processing runs in the background for the life of the process;
+    // its timer is unref'd so it never holds the process open.
+    joins.start();
     return runtime;
   }
 }

@@ -25,9 +25,10 @@ export type JoinQueueEnqueueInput = { text?: unknown; links?: unknown };
 /**
  * A persistent, account-scoped queue of group invite links. The background
  * processor joins exactly one group at a time, gated by the same
- * anti-restriction policy as manual joins (safety/limits.ts): a random 30-90
- * minute gap between joins, a per-day ceiling, and daytime-only operation.
- * Every item is durable, so a restart never loses the queued links.
+ * anti-restriction policy as manual joins (safety/limits.ts): a random 2-4
+ * hour gap between joins, a one-per-five-hour burst window, a five-per-day
+ * ceiling, and daytime-only operation. Every item is durable, so a restart
+ * never loses the queued links.
  */
 export class JoinQueueService {
   private timer: NodeJS.Timeout | null = null;
@@ -42,6 +43,9 @@ export class JoinQueueService {
   public start(): void {
     this.stop();
     this.timer = setInterval(() => void this.processNextDue(), TICK_MS);
+    // The queue is a background service; a pending tick must never keep the
+    // process (or a test runner) alive.
+    this.timer.unref?.();
     void this.processNextDue();
   }
 

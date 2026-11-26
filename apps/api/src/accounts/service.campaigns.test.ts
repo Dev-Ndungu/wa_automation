@@ -8,6 +8,7 @@ process.env.DATABASE_PATH = `/tmp/wa-account-campaigns-test-${process.pid}.db`;
 const { bootstrapDatabase } = await import('../db/bootstrap.js');
 const { db } = await import('../db/client.js');
 const { AccountService } = await import('./service.js');
+const { JoinQueueService } = await import('../joins/service.js');
 
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
@@ -90,6 +91,22 @@ test('creating a campaign splits targets across connected accounts', async () =>
   await accounts.campaignAction(created.id, 'delete');
   const left = await db.select().from(campaigns).where(eq(campaigns.distributionId, created.distributionId));
   assert.equal(left.length, 0, 'deleting the combined campaign removes every shard');
+});
+
+test('creating an account runtime starts the join queue processor', async () => {
+  const originalStart = JoinQueueService.prototype.start;
+  let starts = 0;
+  JoinQueueService.prototype.start = function (this: InstanceType<typeof JoinQueueService>) {
+    starts += 1;
+    return originalStart.call(this);
+  };
+  try {
+    const accounts = new AccountService(loggerStub);
+    await accounts.get('main');
+    assert.equal(starts, 1);
+  } finally {
+    JoinQueueService.prototype.start = originalStart;
+  }
 });
 
 test('a status campaign stays on the owner account and has no distribution', async () => {
