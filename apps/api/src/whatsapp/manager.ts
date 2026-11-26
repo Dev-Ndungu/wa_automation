@@ -1,5 +1,8 @@
-import makeWASocket, { Browsers, DisconnectReason, fetchLatestWaWebVersion, useMultiFileAuthState } from '@whiskeysockets/baileys';
-import type { ConnectionState, GroupMetadata, WASocket } from '@whiskeysockets/baileys';
+import makeWASocket, { Browsers, DisconnectReason, fetchLatestWaWebVersion, generateMessageID, useMultiFileAuthState } from '@whiskeysockets/baileys';
+import type { BinaryNode, ConnectionState, GroupMetadata, WASocket } from '@whiskeysockets/baileys';
+import { buildGroupStatusInner, createGroupStatusWrapper, GROUP_STATUS_META } from './group-status.js';
+import type { GroupStatusContent, GroupStatusSecretMode } from './group-status.js';
+import { buildStatusAck } from './status-ack.js';
 import type { FastifyBaseLogger } from 'fastify';
 import QRCode from 'qrcode';
 import { existsSync, readFileSync } from 'node:fs';
@@ -35,6 +38,7 @@ const whatsappBrowser = Browsers.macOS('Safari');
 export class WhatsAppManager {
   private static readonly AUTH_MIRROR_INTERVAL_MS = 5 * 60_000;
 
+  private readonly groupStatusWrapper = createGroupStatusWrapper();
   private socket: WASocket | null = null;
   private connectPromise: Promise<void> | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
@@ -190,8 +194,18 @@ export class WhatsAppManager {
         syncFullHistory: false,
         logger: this.logger as never,
         generateHighQualityLinkPreview: false,
+        // Retry resends come from this cache; the cached object is the inner
+        // message, which the wrapper below turns into the same envelope again.
+        enableRecentMessageCache: true,
+        patchMessageBeforeSending: async (message) => this.groupStatusWrapper.patch(message),
       });
       this.socket = socket;
+      // rc14 registers no CB:status handler. Without an ack the server can
+      // close the stream after ~50 minutes of group-status traffic, so
+      // acknowledge top-level status stanzas as they arrive.
+      (socket.ws as unknown as { on(event: string, listener: (node: BinaryNode) => void): void }).on('CB:status', (node) => {
+        void this.ackStatusStanza(socket, node);
+      });
       socket.ev.on('creds.update', () => {
         void saveCreds().then(() => this.queueAuthSnapshot()).catch((error: unknown) => {
           this.logger.error({ err: error }, 'Unable to save WhatsApp credentials');
@@ -330,11 +344,49 @@ export class WhatsAppManager {
   }
 
   public async syncGroups(): Promise<number> {
+    const jids = await this.participatingGroupJids();
+    this.logger.info({ groups: jids.length }, 'WhatsApp group sync completed');
+    return jids.length;
+  }
+
+  /**
+   * Live group JIDs the account participates in. Also refreshes the local group
+   * cache so targetAllGroups reconciliation sees names and exclusions.
+   */
+  public async participatingGroupJids(): Promise<string[]> {
     if (!this.socket || this.status.state !== 'CONNECTED') throw new Error('WhatsApp is not connected.');
     const available = await this.socket.groupFetchAllParticipating();
     await this.upsertGroups(Object.values(available));
-    this.logger.info({ groups: Object.keys(available).length }, 'WhatsApp group sync completed');
-    return Object.keys(available).length;
+    return Object.keys(available);
+  }
+
+  /** Post a 24-hour status visible only to the members of one group. */
+  public async sendGroupStatus(
+    groupJid: string,
+    content: GroupStatusContent,
+    options: { messageSecret?: GroupStatusSecretMode } = {},
+  ): Promise<void> {
+    if (!groupJid.endsWith('@g.us')) throw new Error('Group statuses can only be posted to a group.');
+    if (!this.socket || this.status.state !== 'CONNECTED') throw new Error('WhatsApp is not connected.');
+    const inner = await buildGroupStatusInner(content, { upload: this.socket.waUploadToServer, logger: this.logger });
+    this.groupStatusWrapper.mark(inner, options.messageSecret);
+    // Relay the inner message, never a pre-built wrapper: getMediaType must see
+    // the top-level image/video so the <enc mediatype> attribute is set before
+    // the patch wraps it into groupStatusMessageV2.
+    await this.socket.relayMessage(groupJid, inner, {
+      messageId: generateMessageID(),
+      additionalNodes: [GROUP_STATUS_META],
+    });
+  }
+
+  private async ackStatusStanza(socket: WASocket, node: BinaryNode): Promise<void> {
+    try {
+      const sendNode = (socket as unknown as { sendNode?: (node: BinaryNode) => Promise<void> }).sendNode;
+      if (!sendNode) return;
+      await sendNode(buildStatusAck(node));
+    } catch (error) {
+      this.logger.warn({ err: error }, 'Unable to acknowledge a WhatsApp status stanza');
+    }
   }
 
   /**
