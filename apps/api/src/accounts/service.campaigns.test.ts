@@ -91,3 +91,22 @@ test('creating a campaign splits targets across connected accounts', async () =>
   const left = await db.select().from(campaigns).where(eq(campaigns.distributionId, created.distributionId));
   assert.equal(left.length, 0, 'deleting the combined campaign removes every shard');
 });
+
+test('a status campaign stays on the owner account and has no distribution', async () => {
+  const accounts = new AccountService(loggerStub);
+  const secondRuntime = await accounts.get(SECOND_ACCOUNT_ID);
+  (secondRuntime.whatsapp as unknown as { getStatus: () => { state: string } }).getStatus = () => ({
+    state: 'CONNECTED', phone: null, lastConnectedAt: null, qrDataUrl: null, error: null,
+  });
+  const mainRuntime = await accounts.get('main');
+  const captured = await mainRuntime.campaigns.captureManualSource({ text: 'Owner status', label: 'Owner status' });
+  const created = await accounts.createCampaign('main', {
+    name: 'Owner status', sourceMessageId: undefined, sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['split-one@g.us'], deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  }) as { distributionId: string | null; targets: Array<{ groupJid: string }> };
+  assert.equal(created.distributionId, null);
+  assert.deepEqual(created.targets.map((target) => target.groupJid), ['split-one@g.us']);
+  const rows = await db.select().from(campaigns).where(eq(campaigns.name, 'Owner status'));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].accountId, 'main');
+});

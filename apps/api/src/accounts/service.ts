@@ -115,9 +115,12 @@ export class AccountService {
   public async createCampaign(ownerId: string, input: CampaignInput) {
     const owner = await this.get(ownerId);
     const plan = await owner.campaigns.plan(input, ownerId);
-    const participants = await this.eligibleParticipantIds(ownerId);
+    // A group status must appear as authored by this account; splitting it
+    // would change the author and multiply the daily budget across accounts.
+    const statusDelivery = plan.deliveryMode === 'GROUP_STATUS';
+    const participants = statusDelivery ? [ownerId] : await this.eligibleParticipantIds(ownerId);
     const memberships = await this.membershipsFor(participants, plan.groupJids);
-    const distributionId = participants.length > 1 ? randomUUID() : null;
+    const distributionId = !statusDelivery && participants.length > 1 ? randomUUID() : null;
     const assignment = assignTargets(plan.groupJids, participants, memberships);
     let firstShardId: string | null = null;
     let ownerShardId: string | null = null;
@@ -142,6 +145,9 @@ export class AccountService {
     const participants = rows.map((row) => row.accountId);
     const sourceAccountId = await this.sourceAccountFor(input, rows[0].sourceAccountId ?? rows[0].accountId);
     const plan = await (await this.get(sourceAccountId)).campaigns.plan(input, sourceAccountId);
+    if (plan.deliveryMode === 'GROUP_STATUS' && rows.length > 1) {
+      throw new Error('Status campaigns cannot be distributed.');
+    }
     const memberships = await this.membershipsFor(participants, plan.groupJids);
     const assignment = assignTargets(plan.groupJids, participants, memberships);
     let firstShardId: string | null = null;

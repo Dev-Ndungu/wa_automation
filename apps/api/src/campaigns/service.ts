@@ -494,6 +494,7 @@ export class CampaignService {
       name: plan.name, sourceMessageReference: plan.sourceIds[0], status: 'DRAFT', intervalSeconds: 0, intervalSecondsList: '[0]',
       dailyRunTime: plan.schedule.type === 'DAILY' ? plan.schedule.time : null, nextRunAt: null, lastRunAt: null,
       scheduleConfig: JSON.stringify(plan.schedule), autoAddJoinedGroups: plan.autoAddJoinedGroups, shuffleOrder: plan.shuffleOrder,
+      deliveryMode: plan.deliveryMode, targetAllGroups: plan.targetAllGroups,
       createdAt, startedAt: null, completedAt: null,
     });
     for (const [position, sourceId] of plan.sourceIds.entries()) {
@@ -681,6 +682,9 @@ export class CampaignService {
   /** Apply a validated plan to one campaign row (a shard when distributed). */
   public async updateFromPlan(id: string, plan: CampaignPlan, groupJids: string[], sourceAccountId?: string) {
     const campaign = await this.requireStatus(id, ['DRAFT', 'QUEUED', 'RUNNING', 'PAUSED', 'COMPLETED', 'STOPPED']);
+    if (plan.deliveryMode !== campaign.deliveryMode) {
+      throw new Error('A campaign cannot change its delivery mode; create a new campaign instead.');
+    }
     const sourceOwner = sourceAccountId ?? campaign.sourceAccountId ?? this.accountId;
     const { byJid } = await this.selectTargets(groupJids);
 
@@ -692,7 +696,7 @@ export class CampaignService {
     await db.update(campaigns).set({
       name: plan.name, sourceMessageReference: plan.sourceIds[0], intervalSeconds: 0, intervalSecondsList: '[0]',
       dailyRunTime: plan.schedule.type === 'DAILY' ? plan.schedule.time : null, scheduleConfig, sourceAccountId: sourceOwner,
-      autoAddJoinedGroups: plan.autoAddJoinedGroups, shuffleOrder: plan.shuffleOrder, nextRunAt,
+      autoAddJoinedGroups: plan.autoAddJoinedGroups, shuffleOrder: plan.shuffleOrder, targetAllGroups: plan.targetAllGroups, nextRunAt,
       lastRunAt: campaign.status === 'RUNNING' ? campaign.lastRunAt : null,
       completedAt: campaign.status === 'COMPLETED' ? null : campaign.completedAt,
     }).where(eq(campaigns.id, id));

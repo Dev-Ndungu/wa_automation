@@ -817,3 +817,20 @@ test('a status campaign rejects text over 1024 characters', async () => {
     /at most 1024/,
   );
 });
+
+test('a status campaign persists its delivery mode and rejects a mode change', async () => {
+  await insertGroup('persisted-status@g.us', 'Persisted status');
+  const captured = await service.captureManualSource({ text: 'Persisted status', label: 'Persisted status' });
+  const created = await service.create({
+    name: 'Persisted status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['persisted-status@g.us'], deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  } as never);
+  assert.equal(created.deliveryMode, 'GROUP_STATUS');
+  await assert.rejects(
+    () => service.update(created.id, {
+      name: 'Persisted status', sourceMessageIds: [captured.sources[0].id],
+      groupJids: ['persisted-status@g.us'], deliveryMode: 'MESSAGE', schedule: { type: 'ONCE' },
+    } as never),
+    /cannot change its delivery mode/,
+  );
+});
