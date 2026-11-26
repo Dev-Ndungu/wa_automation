@@ -227,16 +227,19 @@ export class AccountService {
   /** Groups available when editing, merged across every account in the split. */
   private async editGroupsFor(accountIds: string[]) {
     if (accountIds.length === 0) return [];
-    const rows = await db.select({ jid: groups.whatsappGroupJid, name: groups.name, isExcluded: groups.isExcluded })
+    const rows = await db.select({ jid: groups.whatsappGroupJid, name: groups.name, isExcluded: groups.isExcluded, communityParentJid: groups.communityParentJid })
       .from(groups).where(inArray(groups.accountId, accountIds));
-    const byJid = new Map<string, { whatsappGroupJid: string; name: string; isExcluded: boolean; isScannerEnabled: boolean }>();
+    const byJid = new Map<string, { whatsappGroupJid: string; name: string; isExcluded: boolean; isScannerEnabled: boolean; communityParentJid: string | null }>();
     for (const row of rows) {
       const existing = byJid.get(row.jid);
       if (!existing) {
-        byJid.set(row.jid, { whatsappGroupJid: row.jid, name: row.name, isExcluded: row.isExcluded, isScannerEnabled: true });
-      } else if (!row.isExcluded) {
-        existing.isExcluded = false;
-        existing.name = row.name;
+        byJid.set(row.jid, { whatsappGroupJid: row.jid, name: row.name, isExcluded: row.isExcluded, isScannerEnabled: true, communityParentJid: row.communityParentJid });
+      } else {
+        if (!existing.communityParentJid && row.communityParentJid) existing.communityParentJid = row.communityParentJid;
+        if (!row.isExcluded) {
+          existing.isExcluded = false;
+          existing.name = row.name;
+        }
       }
     }
     return [...byJid.values()].sort((left, right) => left.name.localeCompare(right.name));
