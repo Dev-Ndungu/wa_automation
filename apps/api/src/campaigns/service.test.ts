@@ -36,6 +36,7 @@ type SentCall = { jid: string; content: Record<string, unknown> };
 const sentCalls: SentCall[] = [];
 // Delivery times kept in lockstep with sentCalls, for pacing assertions.
 const sendTimes: number[] = [];
+const statusCalls: Array<{ jid: string; content: unknown }> = [];
 const noop = () => {};
 
 // Stub socket: every send is recorded in sentCalls, in delivery order.
@@ -46,6 +47,9 @@ const whatsappStub = {
       sendTimes.push(Date.now());
     },
   }),
+  sendGroupStatus: async (jid: string, content: unknown) => {
+    statusCalls.push({ jid, content });
+  },
   getStatus: () => ({ state: 'CONNECTED', phone: null, lastConnectedAt: null, qrDataUrl: null, error: null }),
   subscribe: () => noop,
   subscribeGroupJoined: () => noop,
@@ -833,4 +837,60 @@ test('a status campaign persists its delivery mode and rejects a mode change', a
     } as never),
     /cannot change its delivery mode/,
   );
+});
+
+test('a group-status campaign posts one status per group and stamps last_status_sent_at', async () => {
+  await insertGroup('status-one@g.us', 'Status one');
+  await insertGroup('status-two@g.us', 'Status two');
+  const captured = await service.captureManualSource({ text: 'Status text', label: 'Status text' });
+  const created = await service.create({
+    name: 'Status run', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['status-one@g.us', 'status-two@g.us'], deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  } as never);
+  statusCalls.length = 0;
+  await service.start(created.id);
+  await waitForTargetsSent(created.id, 10_000, 2);
+
+  assert.equal(statusCalls.length, 2);
+  assert.deepEqual(statusCalls.map((call) => call.jid).sort(), ['status-one@g.us', 'status-two@g.us']);
+  assert.deepEqual(statusCalls[0].content, { text: 'Status text' });
+  const rows = await db.select({ jid: groups.whatsappGroupJid, lastStatusSentAt: groups.lastStatusSentAt, lastCampaignSentAt: groups.lastCampaignSentAt })
+    .from(groups).where(inArray(groups.whatsappGroupJid, ['status-one@g.us', 'status-two@g.us']));
+  assert.ok(rows.every((row) => row.lastStatusSentAt));
+  assert.ok(rows.every((row) => row.lastCampaignSentAt === null));
+});
+
+test('a group inside the status cooldown is parked, not sent', async () => {
+  await insertGroup('cooled-status@g.us', 'Cooled status', { lastCampaignSentAt: null });
+  await db.update(groups).set({ lastStatusSentAt: new Date(Date.now() - 3_600_000).toISOString() })
+    .where(eq(groups.whatsappGroupJid, 'cooled-status@g.us'));
+  const captured = await service.captureManualSource({ text: 'Cooled status', label: 'Cooled status' });
+  const created = await service.create({
+    name: 'Cooled status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['cooled-status@g.us'], deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  } as never);
+  statusCalls.length = 0;
+  await service.start(created.id);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const [target] = await db.select().from(campaignTargets).where(eq(campaignTargets.campaignId, created.id));
+  assert.equal(target.status, 'WAITING');
+  const delay = Date.parse(target.scheduledAt!) - Date.now();
+  assert.ok(delay >= 47 * 3_600_000 && delay <= 97 * 3_600_000);
+  assert.equal(statusCalls.length, 0);
+  await service.stop(created.id);
+});
+
+test('starting a status campaign while disconnected is rejected', async () => {
+  await insertGroup('offline-status@g.us', 'Offline status');
+  const offlineStub = { ...whatsappStub, getStatus: () => ({ state: 'DISCONNECTED', phone: null, lastConnectedAt: null, qrDataUrl: null, error: null }) } as unknown as WhatsAppManager;
+  const offline = new CampaignService(offlineStub, loggerStub, 'main', {
+    minSendGapSeconds: 0, sendGapSeconds: () => 0, warmupSeconds: () => 0,
+    reconnectSettleMs: () => 0, dailyBudgetResetMs: () => 300, sendWindowDelayMs: () => 0,
+  });
+  const captured = await service.captureManualSource({ text: 'Offline status', label: 'Offline status' });
+  const created = await service.create({
+    name: 'Offline status', sourceMessageIds: [captured.sources[0].id],
+    groupJids: ['offline-status@g.us'], deliveryMode: 'GROUP_STATUS', schedule: { type: 'ONCE' },
+  } as never);
+  await assert.rejects(() => offline.start(created.id), /must be connected/);
 });

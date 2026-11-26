@@ -32,8 +32,22 @@ export function campaignRoutes(accounts: AccountService) {
         return reply.code(400).send({ message });
       }
     });
-    app.post('/api/campaigns/:id/start', async (request) => accounts.campaignAction(idFrom(request), 'start'));
-    app.post('/api/campaigns/:id/run-now', async (request) => accounts.campaignAction(idFrom(request), 'run-now'));
+    app.post('/api/campaigns/:id/start', async (request, reply) => {
+      try {
+        return await accounts.campaignAction(idFrom(request), 'start');
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Could not start the campaign.';
+        return reply.code(400).send({ message });
+      }
+    });
+    app.post('/api/campaigns/:id/run-now', async (request, reply) => {
+      try {
+        return await accounts.campaignAction(idFrom(request), 'run-now');
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Could not start the campaign.';
+        return reply.code(400).send({ message });
+      }
+    });
     app.post('/api/campaigns/:id/pause', async (request) => accounts.campaignAction(idFrom(request), 'pause'));
     app.post('/api/campaigns/:id/resume', async (request) => accounts.campaignAction(idFrom(request), 'resume'));
     app.post('/api/campaigns/:id/stop', async (request) => accounts.campaignAction(idFrom(request), 'stop'));

@@ -34,6 +34,9 @@ export const SEND_GAP = { minSeconds: 60, maxSeconds: 240 };
 /** Random cooldown after a group received a campaign, drawn once per parking. */
 export const GROUP_COOLDOWN = { minHours: 18, maxHours: 48 };
 
+/** Random cooldown after a group received a status, drawn once per parking. */
+export const STATUS_GROUP_COOLDOWN = { minHours: 48, maxHours: 96 };
+
 /** Random grace for a freshly joined group before its first campaign send. */
 export const NEW_GROUP_GRACE = { minMinutes: 120, maxMinutes: 360 };
 
@@ -143,6 +146,12 @@ export function drawCampaignWarmupSeconds(rng: () => number = Math.random): numb
 /** Uniform group cooldown in milliseconds, from GROUP_COOLDOWN hours. */
 export function drawGroupCooldownMs(rng: () => number = Math.random): number {
   const hours = GROUP_COOLDOWN.minHours + rng() * (GROUP_COOLDOWN.maxHours - GROUP_COOLDOWN.minHours);
+  return Math.floor(hours * 3_600_000);
+}
+
+/** Uniform status cooldown in milliseconds, from STATUS_GROUP_COOLDOWN hours. */
+export function drawStatusGroupCooldownMs(rng: () => number = Math.random): number {
+  const hours = STATUS_GROUP_COOLDOWN.minHours + rng() * (STATUS_GROUP_COOLDOWN.maxHours - STATUS_GROUP_COOLDOWN.minHours);
   return Math.floor(hours * 3_600_000);
 }
 

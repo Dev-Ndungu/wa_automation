@@ -19,6 +19,7 @@ const {
   drawReconnectBackoffSeconds,
   drawReconnectSettleSeconds,
   drawSendGapSeconds,
+  drawStatusGroupCooldownMs,
   GROUP_COOLDOWN,
   JOIN_BURST,
   JOIN_DAILY_LIMIT,
@@ -157,4 +158,10 @@ test('drawReconnectSettleSeconds draws whole seconds across the frozen 120-300s 
 test('circuit breaker threshold is a positive frozen constant', () => {
   assert.equal(CIRCUIT_BREAKER_CONSECUTIVE_FAILURES, 5);
   assert.ok(Number.isInteger(CIRCUIT_BREAKER_CONSECUTIVE_FAILURES) && CIRCUIT_BREAKER_CONSECUTIVE_FAILURES > 0);
+});
+
+test('drawStatusGroupCooldownMs draws from the 48-96 hour range', () => {
+  assert.equal(drawStatusGroupCooldownMs(() => 0), 48 * 3_600_000);
+  assert.equal(drawStatusGroupCooldownMs(() => 0.5), 72 * 3_600_000);
+  assert.equal(drawStatusGroupCooldownMs(() => 1), 96 * 3_600_000);
 });
